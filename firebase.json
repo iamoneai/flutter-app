@@ -1,10 +1,18 @@
 {
-  "hosting": {
-    "site": "iamoneai-mobile",
-    "public": "build/web",
-    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
-    "rewrites": [{"source": "**", "destination": "/index.html"}]
-  },
+  "hosting": [
+    {
+      "site": "iamoneai-mobile",
+      "public": "build/web",
+      "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+      "rewrites": [{"source": "**", "destination": "/index.html"}]
+    },
+    {
+      "site": "iamoneai-entity",
+      "public": "build/web",
+      "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+      "rewrites": [{"source": "**", "destination": "/index.html"}]
+    }
+  ],
   "functions": {
     "source": "functions/chat",
     "runtime": "nodejs18"

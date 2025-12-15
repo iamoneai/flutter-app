@@ -1,13 +1,11 @@
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/foundation.dart';
 import 'user_onboarding_service.dart';
 
 class UserAuthService {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  final FirebaseFunctions _functions = FirebaseFunctions.instance;
   final UserOnboardingService _onboardingService = UserOnboardingService();
 
   // Get current user
@@ -30,6 +28,7 @@ class UserAuthService {
   }
 
   // Register new user with email and password
+  // Creates Firebase Auth user, user profile, and Personal IIN
   Future<Map<String, dynamic>> registerUser({
     required String email,
     required String password,
@@ -51,49 +50,23 @@ class UserAuthService {
       // Update display name
       await user.updateDisplayName('$firstName $lastName');
 
-      // Generate IIN via Cloud Function
-      String? iin;
-      try {
-        final callable = _functions.httpsCallable('registerUser');
-        final result = await callable.call({
-          'email': email.trim().toLowerCase(),
-          'firstName': firstName.trim(),
-          'lastName': lastName.trim(),
-        });
-        iin = result.data['iin'] as String?;
-      } catch (e) {
-        debugPrint('Cloud function error: $e');
-        // Generate local IIN if function fails
-        iin = _generateLocalIIN();
-      }
-
-      // Initialize user with onboarding service (creates profile + copies admin categories/settings)
-      await _onboardingService.initializeNewUser(
+      // Initialize user with onboarding service
+      // This creates: user profile, Personal IIN (20AA format), IIN access, user session
+      final personalIinId = await _onboardingService.initializeNewUser(
         uid: user.uid,
         displayName: '$firstName $lastName'.trim(),
         email: email.trim().toLowerCase(),
-        iin: iin ?? '',
         firstName: firstName.trim(),
         lastName: lastName.trim(),
       );
 
       return {
         'user': user,
-        'iin': iin,
+        'personalIinId': personalIinId,
       };
     } on FirebaseAuthException catch (e) {
       throw _handleAuthError(e);
     }
-  }
-
-  // Generate local IIN if cloud function fails
-  String _generateLocalIIN() {
-    final now = DateTime.now();
-    final year = (now.year % 100).toString().padLeft(2, '0');
-    final random1 = (now.millisecondsSinceEpoch % 10000).toString().padLeft(4, '0');
-    final random2 = (now.microsecondsSinceEpoch % 10000).toString().padLeft(4, '0');
-    final check = ((int.parse(random1) + int.parse(random2)) % 10000).toString().padLeft(4, '0');
-    return '$year$random1$random2$check';
   }
 
   // Sign out
@@ -112,10 +85,10 @@ class UserAuthService {
     }
   }
 
-  // Check if user has completed registration (has IIN)
+  // Check if user has completed registration (has Personal IIN)
   Future<bool> hasCompletedRegistration(String uid) async {
     final profile = await getUserProfile(uid);
-    return profile != null && profile['iin'] != null;
+    return profile != null && profile['personalIinId'] != null;
   }
 
   // Check if user is onboarded, if not, run onboarding

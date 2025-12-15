@@ -1,40 +1,71 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
+import '../../core/services/iin_service.dart';
+import '../../core/utils/iin_generator.dart';
 
 class UserOnboardingService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final IINService _iinService = IINService();
 
   /// Initialize a new user with admin default categories and settings
-  Future<void> initializeNewUser({
+  /// Creates user profile and Personal IIN
+  Future<String> initializeNewUser({
     required String uid,
     required String displayName,
     required String email,
-    required String iin,
     String? firstName,
     String? lastName,
   }) async {
     try {
-      // 1. Create user profile
+      // 1. Generate Personal IIN (20AA-YYMM-XXXX-XXXX)
+      final personalIinId = IINGenerator.generatePersonalIIN();
+
+      // 2. Create user profile with personalIinId
       await _firestore.collection('users').doc(uid).set({
         'displayName': displayName,
         'email': email.toLowerCase(),
-        'iin': iin,
+        'personalIinId': personalIinId,
         'firstName': firstName,
         'lastName': lastName,
         'role': 'user',
-        'status': 'ACTIVE',
+        'status': 'active',
         'onboarded': true,
         'createdAt': FieldValue.serverTimestamp(),
         'updatedAt': FieldValue.serverTimestamp(),
       });
 
-      // 2. FETCH and COPY admin categories to user
+      // 3. Create IIN document in /iins collection
+      await _firestore.collection('iins').doc(personalIinId).set({
+        'iinType': 'personal',
+        'ownerType': 'user',
+        'ownerId': uid,
+        'status': 'active',
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      // 4. Create IIN access mapping (user owns their personal IIN)
+      await _firestore.collection('iin_access').add({
+        'iinId': personalIinId,
+        'uid': uid,
+        'role': 'owner',
+        'active': true,
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      // 5. Set this as the active IIN in user session
+      await _firestore.collection('user_sessions').doc(uid).set({
+        'activeIinId': personalIinId,
+        'lastUpdated': FieldValue.serverTimestamp(),
+      });
+
+      // 6. FETCH and COPY admin categories to user
       await _copyAdminCategories(uid);
 
-      // 3. FETCH and COPY admin global settings to user
+      // 7. FETCH and COPY admin global settings to user
       await _copyAdminSettings(uid);
 
-      debugPrint('User onboarding completed for: $uid');
+      debugPrint('User onboarding completed for: $uid with IIN: $personalIinId');
+      return personalIinId;
     } catch (e) {
       debugPrint('Error during user onboarding: $e');
       rethrow;

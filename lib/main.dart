@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'dart:html' as html show window;
 import 'firebase_options.dart';
 import 'user/screens/user_auth_wrapper.dart';
 import 'user/screens/user_login_screen.dart';
@@ -21,6 +23,27 @@ void main() async {
   runApp(const IAMONEAIApp());
 }
 
+/// Detect which site we're on based on hostname
+String _getInitialRoute() {
+  if (kIsWeb) {
+    final hostname = html.window.location.hostname ?? '';
+
+    // Admin site - NOT USING SEPARATE SITE, use #/admin route instead
+    // if (hostname.contains('iamoneai-admin')) {
+    //   return '/admin';
+    // }
+
+    // Entity/Business site
+    if (hostname.contains('iamoneai-entity')) {
+      return '/entity';
+    }
+
+    // Default: User site (iamoneai-mobile or localhost)
+    return '/';
+  }
+  return '/';
+}
+
 class IAMONEAIApp extends StatelessWidget {
   const IAMONEAIApp({super.key});
 
@@ -37,7 +60,7 @@ class IAMONEAIApp extends StatelessWidget {
         scaffoldBackgroundColor: const Color(0xFF0a0a0f),
         useMaterial3: true,
       ),
-      initialRoute: '/',
+      initialRoute: _getInitialRoute(),
       routes: {
         '/': (context) => const UserAuthWrapper(),
         '/user': (context) => const UserAuthWrapper(),

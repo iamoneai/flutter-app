@@ -1,0 +1,105 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ============================================
+    // HELPER FUNCTIONS
+    // ============================================
+
+    // Check if the user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if the user is accessing their own data
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Check if user is an admin (exists in admin/users collection)
+    function isAdmin() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/admin/users/$(request.auth.uid));
+    }
+
+    // Check if user has a specific admin role
+    function hasAdminRole(role) {
+      return isAdmin() &&
+        get(/databases/$(database)/documents/admin/users/$(request.auth.uid)).data.role == role;
+    }
+
+    // Check if user is super admin
+    function isSuperAdmin() {
+      return hasAdminRole('super_admin');
+    }
+
+    // ============================================
+    // ADMIN COLLECTIONS
+    // ============================================
+
+    // Admin config - authenticated users can READ (for onboarding copy)
+    // Only Cloud Functions/super admins can write
+    match /admin/config/{document=**} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // Admin users collection - only admins can access
+    match /admin/users/{userId} {
+      allow read: if isAdmin();
+      allow write: if isSuperAdmin();
+    }
+
+    // Admin root document
+    match /admin/{document} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // ============================================
+    // USER COLLECTIONS
+    // ============================================
+
+    // User profile - users can only access their own
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId);
+      allow delete: if isOwner(userId) || isSuperAdmin();
+    }
+
+    // User settings - users can only access their own
+    match /users/{userId}/settings/{settingId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // User categories - users can only access their own
+    match /users/{userId}/categories/{categoryId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // User memories - users can only access their own
+    match /users/{userId}/memories/{memoryId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // User chats - users can only access their own
+    match /users/{userId}/chats/{chatId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // User chat messages (nested under chats)
+    match /users/{userId}/chats/{chatId}/messages/{messageId} {
+      allow read, write: if isOwner(userId);
+    }
+
+    // ============================================
+    // CATCH-ALL (deny by default)
+    // ============================================
+
+    // Deny access to any other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

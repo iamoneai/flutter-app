@@ -1,0 +1,772 @@
+import {onRequest} from "firebase-functions/v2/https";
+import * as admin from "firebase-admin";
+import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
+import cors from "cors";
+import {v4 as uuidv4} from "uuid";
+
+admin.initializeApp();
+const db = admin.firestore();
+const corsHandler = cors({origin: true});
+
+// ============ INTERFACES ============
+interface ChatRequest {
+  message: string;
+  userId: string;
+  context: "personal" | "work" | "family";
+}
+
+interface ChatResponse {
+  message: string;
+  debug: {
+    llmUsed: string;
+    category: string;
+    latencyMs: number;
+    tokensIn: number;
+    tokensOut: number;
+    source: string;
+    memoriesUsed?: number;
+    memoriesSaved?: number;
+  };
+}
+
+interface MemoryRequest {
+  userId: string;
+  content: string;
+  type?: "fact" | "opinion" | "belief" | "episodic";
+  context?: "personal" | "work" | "family";
+  importance?: number;
+}
+
+interface Memory {
+  id: string;
+  userId: string;
+  content: string;
+  type: string;
+  context: string;
+  importance: number;
+  createdAt: FirebaseFirestore.Timestamp;
+}
+
+interface ApiKeys {
+  claude?: string;
+  openai?: string;
+  gemini?: string;
+}
+
+interface Category {
+  id: string;
+  name: string;
+  keywords: string[];
+  primaryLLM: string;
+  fallbackLLM: string;
+  system_prompt?: string;
+}
+
+interface GlobalSettings {
+  guardrails?: {
+    blocked_domains?: string[];
+    restricted_domains?: string[];
+    restricted_domain_disclaimer?: string;
+  };
+}
+
+interface InfrastructureConfig {
+  vertexai?: {
+    project_id?: string;
+    region?: string;
+    index_id?: string;
+    index_endpoint_id?: string;
+    deployed_index_id?: string;
+    embedding_model?: string;
+    enabled?: boolean;
+    public_domain?: string;
+  };
+}
+
+// ============ CONFIG LOADERS (FROM FIRESTORE) ============
+function normalizeLLMName(name: string): string {
+  const mapping: Record<string, string> = {
+    "claude-haiku": "claude",
+    "claude-sonnet": "claude",
+    "gpt-4o-mini": "openai",
+    "gpt-4o": "openai",
+    "gemini-flash": "gemini",
+    "gemini-pro": "gemini",
+  };
+  return mapping[name] || name;
+}
+
+async function getApiKeys(): Promise<ApiKeys> {
+  const doc = await db.collection("admin").doc("api_keys").get();
+  if (!doc.exists) return {};
+  const data = doc.data();
+  return {
+    claude: data?.anthropic?.key,
+    openai: data?.openai?.key,
+    gemini: data?.google?.key,
+  };
+}
+
+async function getCategories(): Promise<Category[]> {
+  const snapshot = await db.collection("admin").doc("config")
+    .collection("categories").get();
+  return snapshot.docs.map((doc) => ({id: doc.id, ...doc.data()} as Category));
+}
+
+async function getGlobalSettings(): Promise<GlobalSettings> {
+  const doc = await db.collection("admin").doc("config")
+    .collection("settings").doc("global").get();
+  if (!doc.exists) return {};
+  return doc.data() as GlobalSettings;
+}
+
+async function getInfrastructureConfig(): Promise<InfrastructureConfig> {
+  const doc = await db.collection("admin").doc("config")
+    .collection("settings").doc("infrastructure").get();
+  if (!doc.exists) return {};
+  return doc.data() as InfrastructureConfig;
+}
+
+function classifyMessage(message: string, categories: Category[]): Category | null {
+  const lowerMessage = message.toLowerCase();
+  for (const category of categories) {
+    if (!category.keywords) continue;
+    for (const keyword of category.keywords) {
+      if (lowerMessage.includes(keyword.toLowerCase())) {
+        return category;
+      }
+    }
+  }
+  return categories.find((c) => c.id === "simple_chat") || null;
+}
+
+function checkGuardrails(message: string, settings: GlobalSettings) {
+  const lowerMessage = message.toLowerCase();
+  const blocked = settings.guardrails?.blocked_domains || [];
+  const restricted = settings.guardrails?.restricted_domains || [];
+
+  for (const domain of blocked) {
+    if (lowerMessage.includes(domain)) {
+      return {blocked: true, restricted: false, domain};
+    }
+  }
+  for (const domain of restricted) {
+    if (lowerMessage.includes(domain)) {
+      return {blocked: false, restricted: true, domain};
+    }
+  }
+  return {blocked: false, restricted: false};
+}
+
+// ============ EMBEDDING FUNCTIONS ============
+async function generateEmbedding(text: string, apiKey: string, model: string): Promise<number[]> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
+  
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      model: `models/${model}`,
+      content: {parts: [{text}]},
+    }),
+  });
+
+  const data = await response.json();
+  if (data.error) {
+    throw new Error(data.error.message || "Embedding API error");
+  }
+  
+  return data.embedding?.values || [];
+}
+
+// ============ MEMORY FUNCTIONS ============
+async function saveMemoryToFirestore(
+  memory: MemoryRequest,
+  apiKey: string,
+  infraConfig: InfrastructureConfig
+): Promise<string> {
+  const memoryId = uuidv4();
+  const embeddingModel = infraConfig.vertexai?.embedding_model || "text-embedding-004";
+  
+  // Generate embedding
+  let embedding: number[] = [];
+  try {
+    embedding = await generateEmbedding(memory.content, apiKey, embeddingModel);
+  } catch (e) {
+    console.error("Embedding generation failed:", e);
+  }
+  
+  // Save to Firestore
+  const memoryDoc = {
+    id: memoryId,
+    userId: memory.userId,
+    content: memory.content,
+    type: memory.type || "fact",
+    context: memory.context || "personal",
+    importance: memory.importance || 0.5,
+    createdAt: admin.firestore.Timestamp.now(),
+    embeddingSize: embedding.length,
+  };
+  
+  await db.collection("users").doc(memory.userId)
+    .collection("memories").doc(memoryId).set(memoryDoc);
+  
+  // Upsert to Vertex AI if configured
+    console.log("Vector upsert check:", { enabled: infraConfig.vertexai?.enabled, embeddingLength: embedding.length });
+  if (infraConfig.vertexai?.enabled && embedding.length > 0) {
+    try {
+      await upsertToVectorIndex(memoryId, embedding, memory.userId, infraConfig);
+    } catch (e) {
+      console.error("Vector upsert failed (memory still saved):", e);
+    }
+  }
+  
+  return memoryId;
+}
+
+async function upsertToVectorIndex(
+  id: string,
+  embedding: number[],
+  userId: string,
+  infraConfig: InfrastructureConfig
+): Promise<void> {
+  const {IndexServiceClient} = await import("@google-cloud/aiplatform");
+  
+  const region = infraConfig.vertexai?.region || "us-central1";
+  const projectId = infraConfig.vertexai?.project_id || "app-iamoneai-c36ec";
+  const indexId = infraConfig.vertexai?.index_id;
+  
+  if (!indexId) {
+    console.log("Vertex AI index_id not configured, skipping vector upsert");
+    return;
+  }
+  
+  const client = new IndexServiceClient({
+    apiEndpoint: `${region}-aiplatform.googleapis.com`,
+  });
+
+  const indexName = `projects/${projectId}/locations/${region}/indexes/${indexId}`;
+
+  await client.upsertDatapoints({
+    index: indexName,
+    datapoints: [{
+      datapointId: id,
+      featureVector: embedding,
+      restricts: [{namespace: "userId", allowList: [userId]}],
+    }],
+  });
+  console.log(`Upserted datapoint ${id} to vector index`);
+}
+
+async function searchMemories(
+  query: string,
+  userId: string,
+  apiKey: string,
+  infraConfig: InfrastructureConfig,
+  limit = 5
+): Promise<Memory[]> {
+  // If Vertex AI not configured, fall back to recent memories
+  if (!infraConfig.vertexai?.enabled || !infraConfig.vertexai?.index_endpoint_id) {
+    return getRecentMemories(userId, limit);
+  }
+  
+  const embeddingModel = infraConfig.vertexai.embedding_model || "text-embedding-004";
+  const queryEmbedding = await generateEmbedding(query, apiKey, embeddingModel);
+  
+  const publicDomain = infraConfig.vertexai.public_domain;
+  const deployedIndexId = infraConfig.vertexai.deployed_index_id;
+  const projectId = infraConfig.vertexai.project_id || "app-iamoneai-c36ec";
+  const region = infraConfig.vertexai.region || "us-central1";
+  const endpointId = infraConfig.vertexai.index_endpoint_id;
+  
+  if (!publicDomain || !deployedIndexId) {
+    console.log("Missing public_domain or deployed_index_id, falling back to recent");
+    return getRecentMemories(userId, limit);
+  }
+  
+  try {
+    // Use REST API for public endpoints
+    const {GoogleAuth} = await import("google-auth-library");
+    const auth = new GoogleAuth();
+    const accessToken = await auth.getAccessToken();
+    
+    const url = `https://${publicDomain}/v1/projects/${projectId}/locations/${region}/indexEndpoints/${endpointId}:findNeighbors`;
+    
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        deployed_index_id: deployedIndexId,
+        queries: [{
+          datapoint: { feature_vector: queryEmbedding },
+          neighbor_count: limit,
+        }],
+      }),
+    });
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Vector search failed: ${response.status} ${errorText}`);
+    }
+    
+    const data = await response.json() as {nearest_neighbors?: [{neighbors?: [{datapoint?: {datapoint_id?: string}}]}]};
+    console.log("Vector search raw response:", JSON.stringify(data).substring(0, 500));
+    
+    const memoryIds = data.nearest_neighbors?.[0]?.neighbors?.map(
+      (n) => n.datapoint?.datapoint_id
+    ).filter(Boolean) || [];
+    
+    if (memoryIds.length === 0) {
+      console.log("No vector matches, falling back to recent");
+      return getRecentMemories(userId, limit);
+    }
+    
+    console.log(`Vector search found ${memoryIds.length} matches:`, memoryIds);
+    
+    // Fetch full memories from Firestore
+    const memories: Memory[] = [];
+    for (const memId of memoryIds) {
+      const doc = await db.collection("users").doc(userId)
+        .collection("memories").doc(memId as string).get();
+      if (doc.exists) {
+        memories.push(doc.data() as Memory);
+      }
+    }
+    
+    return memories;
+  } catch (error) {
+    console.error("Vector search error, falling back to recent:", error);
+    return getRecentMemories(userId, limit);
+  }
+}
+
+async function getRecentMemories(userId: string, limit: number): Promise<Memory[]> {
+  const snapshot = await db.collection("users").doc(userId)
+    .collection("memories")
+    .orderBy("createdAt", "desc")
+    .limit(limit)
+    .get();
+  return snapshot.docs.map((doc) => doc.data() as Memory);
+}
+
+function formatMemoriesForPrompt(memories: Memory[]): string {
+  if (memories.length === 0) return "";
+  
+  const memoryText = memories.map((m) => 
+    `[${m.type.toUpperCase()}] ${m.content}`
+  ).join("\n");
+  
+  return `\n\n## Relevant Memories About This User:\n${memoryText}\n`;
+}
+
+// ============ LLM FUNCTIONS (UNCHANGED) ============
+async function callClaude(apiKey: string, message: string, systemPrompt: string) {
+  const client = new Anthropic({apiKey});
+  const response = await client.messages.create({
+    model: "claude-3-haiku-20240307",
+    max_tokens: 1024,
+    system: systemPrompt,
+    messages: [{role: "user", content: message}],
+  });
+  const content = response.content[0].type === "text" ? response.content[0].text : "";
+  return {
+    content,
+    tokensIn: response.usage?.input_tokens || 0,
+    tokensOut: response.usage?.output_tokens || 0,
+  };
+}
+
+async function callOpenAI(apiKey: string, message: string, systemPrompt: string) {
+  const client = new OpenAI({apiKey});
+  const response = await client.chat.completions.create({
+    model: "gpt-4o-mini",
+    max_tokens: 1024,
+    messages: [
+      {role: "system", content: systemPrompt},
+      {role: "user", content: message},
+    ],
+  });
+  return {
+    content: response.choices[0]?.message?.content || "",
+    tokensIn: response.usage?.prompt_tokens || 0,
+    tokensOut: response.usage?.completion_tokens || 0,
+  };
+}
+
+async function callGemini(apiKey: string, message: string, systemPrompt: string) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      system_instruction: {parts: [{text: systemPrompt}]},
+      contents: [{parts: [{text: message}]}],
+    }),
+  });
+  const data = await response.json();
+  if (data.error) {
+    throw new Error(data.error.message || "Gemini API error");
+  }
+  return {
+    content: data.candidates?.[0]?.content?.parts?.[0]?.text || "",
+    tokensIn: data.usageMetadata?.promptTokenCount || 0,
+    tokensOut: data.usageMetadata?.candidatesTokenCount || 0,
+  };
+}
+
+type LLMCaller = (apiKey: string, message: string, systemPrompt: string) => Promise<{content: string; tokensIn: number; tokensOut: number}>;
+
+const LLM_MAP: Record<string, {call: LLMCaller; label: string; keyName: keyof ApiKeys}> = {
+  claude: {call: callClaude, label: "claude-haiku", keyName: "claude"},
+  openai: {call: callOpenAI, label: "gpt-4o-mini", keyName: "openai"},
+  gemini: {call: callGemini, label: "gemini-flash", keyName: "gemini"},
+};
+
+async function routeToLLM(message: string, category: Category, apiKeys: ApiKeys, systemPrompt: string) {
+  const errors: string[] = [];
+
+  const primary = normalizeLLMName(category.primaryLLM);
+  const fallback = normalizeLLMName(category.fallbackLLM);
+  const allLLMs = ["claude", "openai", "gemini"];
+  
+  const orderedLLMs = [primary];
+  if (fallback && fallback !== primary) orderedLLMs.push(fallback);
+  for (const llm of allLLMs) {
+    if (!orderedLLMs.includes(llm)) orderedLLMs.push(llm);
+  }
+
+  console.log(`Routing order: ${orderedLLMs.join(" -> ")}`);
+
+  for (const llmName of orderedLLMs) {
+    const llm = LLM_MAP[llmName];
+    if (!llm) {
+      errors.push(`${llmName}: unknown LLM`);
+      continue;
+    }
+    
+    const apiKey = apiKeys[llm.keyName];
+    if (!apiKey) {
+      errors.push(`${llmName}: no key`);
+      continue;
+    }
+    
+    try {
+      console.log(`Trying ${llmName}...`);
+      const result = await llm.call(apiKey, message, systemPrompt);
+      console.log(`${llmName} succeeded`);
+      return {...result, llmUsed: llm.label};
+    } catch (error: unknown) {
+      const errMsg = error instanceof Error ? error.message : "Unknown error";
+      console.error(`${llmName} failed:`, errMsg);
+      errors.push(`${llmName}: ${errMsg}`);
+    }
+  }
+
+  throw new Error(`All LLMs failed: ${errors.join("; ")}`);
+}
+
+// ============ CLOUD FUNCTIONS ============
+
+// Main chat endpoint (with memory support)
+export const chat = onRequest({memory: "512MiB", timeoutSeconds: 120}, (req, res) => {
+  corsHandler(req, res, async () => {
+    if (req.method !== "POST") {
+      res.status(405).json({error: "Method not allowed"});
+      return;
+    }
+
+    const startTime = Date.now();
+
+    try {
+      const {message, userId, context} = req.body as ChatRequest;
+
+      if (!message || !userId) {
+        res.status(400).json({error: "message and userId are required"});
+        return;
+      }
+
+      const [apiKeys, categories, settings, infraConfig] = await Promise.all([
+        getApiKeys(),
+        getCategories(),
+        getGlobalSettings(),
+        getInfrastructureConfig(),
+      ]);
+
+      console.log("Keys available:", {
+        openai: !!apiKeys.openai,
+        gemini: !!apiKeys.gemini,
+        claude: !!apiKeys.claude,
+      });
+      console.log("Vertex AI enabled:", infraConfig.vertexai?.enabled || false);
+      console.log("Vertex config:", JSON.stringify(infraConfig.vertexai));
+
+      const guardrailCheck = checkGuardrails(message, settings);
+      if (guardrailCheck.blocked) {
+        res.json({
+          message: `I can't help with "${guardrailCheck.domain}" topics.`,
+          debug: {
+            llmUsed: "none",
+            category: "blocked",
+            latencyMs: Date.now() - startTime,
+            tokensIn: 0,
+            tokensOut: 0,
+            source: "guardrail_block",
+          },
+        } as ChatResponse);
+        return;
+      }
+
+      const category = classifyMessage(message, categories);
+      console.log("Category:", category?.id, "Primary:", category?.primaryLLM, "Fallback:", category?.fallbackLLM);
+
+      if (!category) {
+        res.status(500).json({error: "Could not classify message"});
+        return;
+      }
+
+      // Fetch relevant memories (if Gemini key available for embeddings)
+      let memories: Memory[] = [];
+      let memoriesText = "";
+      
+      if (apiKeys.gemini) {
+        try {
+          memories = await searchMemories(message, userId, apiKeys.gemini, infraConfig, 5);
+          memoriesText = formatMemoriesForPrompt(memories);
+          console.log(`Found ${memories.length} relevant memories`);
+        } catch (error) {
+          console.error("Memory search error:", error);
+        }
+      }
+
+      let systemPrompt = category.system_prompt ||
+        "You are IAMONEAI, a helpful AI assistant. Be concise and friendly.";
+      systemPrompt += `\n\nContext: ${context || "personal"}\nUser: ${userId}`;
+      systemPrompt += memoriesText;
+
+      if (guardrailCheck.restricted) {
+        const disclaimer = settings.guardrails?.restricted_domain_disclaimer ||
+          "Note: This is a restricted topic. Please consult a professional.";
+        systemPrompt += `\n\nIMPORTANT: ${disclaimer}`;
+      }
+
+      const llmResult = await routeToLLM(message, category, apiKeys, systemPrompt);
+      // Auto-save memories from conversation
+      let memoriesSaved = 0;
+      if (apiKeys.gemini && infraConfig) {
+        try {
+          memoriesSaved = await autoSaveMemories(userId, message, apiKeys.gemini, infraConfig);
+        } catch (e) {
+          console.error("Auto-save error:", e);
+        }
+      }
+
+      res.json({
+        message: llmResult.content,
+        debug: {
+          llmUsed: llmResult.llmUsed,
+          category: category.id,
+          latencyMs: Date.now() - startTime,
+          tokensIn: llmResult.tokensIn,
+          tokensOut: llmResult.tokensOut,
+          source: guardrailCheck.restricted ? "llm_restricted" : "llm_primary",
+          memoriesUsed: memories.length,
+          memoriesSaved: memoriesSaved,
+        },
+      } as ChatResponse);
+    } catch (error: unknown) {
+      const errMsg = error instanceof Error ? error.message : "Unknown error";
+      console.error("Chat error:", errMsg);
+      res.status(500).json({
+        error: errMsg || "Internal server error",
+        debug: {
+          llmUsed: "none",
+          category: "error",
+          latencyMs: Date.now() - startTime,
+          tokensIn: 0,
+          tokensOut: 0,
+          source: "error",
+        },
+      });
+    }
+  });
+});
+
+// Memory endpoint (NEW)
+export const memory = onRequest({memory: "512MiB", timeoutSeconds: 120}, (req, res) => {
+  corsHandler(req, res, async () => {
+    if (req.method === "POST") {
+      // Save new memory
+      try {
+        const {userId, content, type, context, importance} = req.body as MemoryRequest;
+
+        if (!userId || !content) {
+          res.status(400).json({error: "userId and content are required"});
+          return;
+        }
+
+        const [apiKeys, infraConfig] = await Promise.all([
+          getApiKeys(),
+          getInfrastructureConfig(),
+        ]);
+
+        if (!apiKeys.gemini) {
+          res.status(500).json({error: "Gemini API key required for embeddings"});
+          return;
+        }
+
+        const memoryId = await saveMemoryToFirestore({
+          userId,
+          content,
+          type: type || "fact",
+          context: context || "personal",
+          importance: importance || 0.5,
+        }, apiKeys.gemini, infraConfig);
+
+        res.json({
+          success: true,
+          memoryId,
+          message: "Memory saved",
+        });
+      } catch (error: unknown) {
+        const errMsg = error instanceof Error ? error.message : "Unknown error";
+        console.error("Memory save error:", errMsg);
+        res.status(500).json({error: errMsg});
+      }
+    } else if (req.method === "GET") {
+      // Search/list memories
+      try {
+        const userId = req.query.userId as string;
+        const query = req.query.query as string;
+        const limit = parseInt(req.query.limit as string) || 10;
+
+        if (!userId) {
+          res.status(400).json({error: "userId is required"});
+          return;
+        }
+
+        const [apiKeys, infraConfig] = await Promise.all([
+          getApiKeys(),
+          getInfrastructureConfig(),
+        ]);
+        
+        if (query && apiKeys.gemini) {
+          const memories = await searchMemories(query, userId, apiKeys.gemini, infraConfig, limit);
+          res.json({memories, count: memories.length, searchType: "semantic"});
+        } else {
+          const memories = await getRecentMemories(userId, limit);
+          res.json({memories, count: memories.length, searchType: "recent"});
+        }
+      } catch (error: unknown) {
+        const errMsg = error instanceof Error ? error.message : "Unknown error";
+        console.error("Memory fetch error:", errMsg);
+        res.status(500).json({error: errMsg});
+      }
+    } else {
+      res.status(405).json({error: "Method not allowed"});
+    }
+  });
+});
+
+// Health check (unchanged)
+export const health = onRequest({memory: "256MiB"}, (req, res) => {
+  corsHandler(req, res, () => {
+    res.json({
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      version: "2.0.0-memory",
+    });
+  });
+});
+
+// ============================================
+// AUTO-MEMORY EXTRACTION
+// ============================================
+
+interface ExtractedFact {
+  content: string;
+  type: "fact" | "opinion" | "belief" | "episodic";
+  confidence: number;
+}
+
+function extractFactsFromMessage(userMessage: string): ExtractedFact[] {
+  const facts: ExtractedFact[] = [];
+  const lowerMsg = userMessage.toLowerCase();
+  
+  // Identity - Name patterns
+  const namePatterns = [
+    /my name is (\w+)/i,
+    /call me (\w+(?:\s+\w+)?)/i,
+  ];
+  
+  for (const pattern of namePatterns) {
+    const match = userMessage.match(pattern);
+    if (match && match[1]) {
+      const notNames = ["a", "the", "not", "very", "so", "here", "there"];
+      if (!notNames.includes(match[1].toLowerCase())) {
+        facts.push({
+          content: `User's name is ${match[1]}`,
+          type: "fact",
+          confidence: 0.95
+        });
+      }
+    }
+  }
+  
+  // Preferences
+  if (/i (?:really )?(?:love|like|enjoy|prefer) /i.test(lowerMsg)) {
+    facts.push({ content: userMessage.trim(), type: "opinion", confidence: 0.85 });
+  }
+  
+  // Explicit remember requests
+  const rememberMatch = userMessage.match(/remember (?:that|this)[:\s]+(.+?)(?:\.|$)/i);
+  if (rememberMatch && rememberMatch[1]) {
+    facts.push({ content: rememberMatch[1].trim(), type: "fact", confidence: 1.0 });
+  }
+  
+  // Location/work
+  if (/i (?:live|work|am from|moved to) /i.test(lowerMsg)) {
+    facts.push({ content: userMessage.trim(), type: "fact", confidence: 0.85 });
+  }
+  
+  // Family
+  if (/my (?:wife|husband|spouse|partner|son|daughter|child|mom|dad|mother|father|brother|sister)/i.test(lowerMsg)) {
+    facts.push({ content: userMessage.trim(), type: "fact", confidence: 0.9 });
+  }
+  
+  return facts;
+}
+
+async function autoSaveMemories(
+  userId: string, 
+  userMessage: string,
+  geminiKey: string,
+  infraConfig: InfrastructureConfig
+): Promise<number> {
+  const facts = extractFactsFromMessage(userMessage);
+  console.log("Auto-save: checking message:", userMessage.substring(0, 50));
+  console.log("Auto-save: extracted facts:", JSON.stringify(facts));
+  let savedCount = 0;
+  
+  for (const fact of facts) {
+    if (fact.confidence >= 0.8) {
+      try {
+        await saveMemoryToFirestore({
+          userId,
+          content: fact.content,
+          type: fact.type,
+          importance: fact.confidence,
+          context: "personal",
+        }, geminiKey, infraConfig);
+        savedCount++;
+        console.log(`Auto-saved: "${fact.content.substring(0, 50)}..."`);
+      } catch (error) {
+        console.error("Auto-save failed:", error);
+      }
+    }
+  }
+  return savedCount;
+}

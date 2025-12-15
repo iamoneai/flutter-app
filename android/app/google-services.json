@@ -1,0 +1,82 @@
+{
+  "project_info": {
+    "project_number": "427305522394",
+    "project_id": "app-iamoneai-c36ec",
+    "storage_bucket": "app-iamoneai-c36ec.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427305522394:android:7e7e497fece0d4927801e3",
+        "android_client_info": {
+          "package_name": "com.example.iamoneai_mobile"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "427305522394-vkokvina49opn4k9uumts3pkfemlika0.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCMZ85ooFfuLLKoIfyUL0WX-x6O6YpNdy4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "427305522394-vkokvina49opn4k9uumts3pkfemlika0.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "427305522394-6l2e1eq0csv611cu0qqm0uningotsj24.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.iamoneaiMobile"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427305522394:android:18d204cc288d1d967801e3",
+        "android_client_info": {
+          "package_name": "com.iamoneai.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "427305522394-vkokvina49opn4k9uumts3pkfemlika0.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCMZ85ooFfuLLKoIfyUL0WX-x6O6YpNdy4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "427305522394-vkokvina49opn4k9uumts3pkfemlika0.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "427305522394-6l2e1eq0csv611cu0qqm0uningotsj24.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.iamoneaiMobile"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

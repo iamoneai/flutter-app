@@ -1,0 +1,15 @@
+# Default ignores
+.gcloudignore
+.git
+.gitignore
+.dart_tool/
+.idea/
+build/
+*.iml
+.pub-cache/
+.pub/
+
+# DO NOT IGNORE KEY FILES (important!)
+# Allow keystore + key.properties into build!
+!android/app/keystore/iamoneai-release.keystore
+!android/key.properties

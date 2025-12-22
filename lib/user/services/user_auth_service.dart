@@ -1,20 +1,21 @@
+// IAMONEAI - Fresh Start
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 import 'package:flutter/foundation.dart';
 import 'user_onboarding_service.dart';
 
+/// User Authentication Service
+/// Handles email/password and Google sign-in
 class UserAuthService {
   final FirebaseAuth _auth = FirebaseAuth.instance;
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final GoogleSignIn _googleSignIn = GoogleSignIn();
   final UserOnboardingService _onboardingService = UserOnboardingService();
 
-  // Get current user
   User? get currentUser => _auth.currentUser;
 
-  // Auth state stream
   Stream<User?> get authStateChanges => _auth.authStateChanges();
 
-  // Sign in with email and password
+  /// Sign in with email and password
   Future<UserCredential> signInWithEmail(String email, String password) async {
     try {
       final credential = await _auth.signInWithEmailAndPassword(
@@ -27,16 +28,73 @@ class UserAuthService {
     }
   }
 
-  // Register new user with email and password
-  // Creates Firebase Auth user, user profile, and Personal IIN
+  /// Sign in with Google
+  Future<Map<String, dynamic>?> signInWithGoogle() async {
+    try {
+      final GoogleSignInAccount? googleUser = await _googleSignIn.signIn();
+
+      if (googleUser == null) {
+        return null;
+      }
+
+      final GoogleSignInAuthentication googleAuth =
+          await googleUser.authentication;
+
+      final credential = GoogleAuthProvider.credential(
+        accessToken: googleAuth.accessToken,
+        idToken: googleAuth.idToken,
+      );
+
+      final userCredential = await _auth.signInWithCredential(credential);
+      final user = userCredential.user;
+
+      if (user == null) return null;
+
+      // Check if user is already onboarded
+      final isOnboarded = await _onboardingService.isUserOnboarded(user.uid);
+
+      if (!isOnboarded) {
+        // New Google user - initialize them
+        final nameParts = (user.displayName ?? '').split(' ');
+        final firstName = nameParts.isNotEmpty ? nameParts.first : '';
+        final lastName =
+            nameParts.length > 1 ? nameParts.sublist(1).join(' ') : '';
+
+        final personalIinId = await _onboardingService.initializeNewUser(
+          uid: user.uid,
+          displayName: user.displayName ?? user.email?.split('@').first ?? '',
+          email: user.email ?? '',
+          firstName: firstName,
+          lastName: lastName,
+        );
+
+        return {
+          'user': user,
+          'personalIinId': personalIinId,
+          'isNewUser': true,
+        };
+      }
+
+      // Existing user
+      final profile = await _onboardingService.getUserProfile(user.uid);
+      return {
+        'user': user,
+        'personalIinId': profile?['personalIinId'],
+        'isNewUser': false,
+      };
+    } catch (e) {
+      debugPrint('Google sign in error: $e');
+      rethrow;
+    }
+  }
+
+  /// Register new user with email and password
   Future<Map<String, dynamic>> registerUser({
     required String email,
     required String password,
-    required String firstName,
-    required String lastName,
+    required String fullName,
   }) async {
     try {
-      // Create Firebase Auth user
       final credential = await _auth.createUserWithEmailAndPassword(
         email: email.trim(),
         password: password,
@@ -47,17 +105,19 @@ class UserAuthService {
         throw Exception('Failed to create user account');
       }
 
-      // Update display name
-      await user.updateDisplayName('$firstName $lastName');
+      await user.updateDisplayName(fullName);
 
-      // Initialize user with onboarding service
-      // This creates: user profile, Personal IIN (20AA format), IIN access, user session
+      final nameParts = fullName.trim().split(' ');
+      final firstName = nameParts.isNotEmpty ? nameParts.first : '';
+      final lastName =
+          nameParts.length > 1 ? nameParts.sublist(1).join(' ') : '';
+
       final personalIinId = await _onboardingService.initializeNewUser(
         uid: user.uid,
-        displayName: '$firstName $lastName'.trim(),
+        displayName: fullName.trim(),
         email: email.trim().toLowerCase(),
-        firstName: firstName.trim(),
-        lastName: lastName.trim(),
+        firstName: firstName,
+        lastName: lastName,
       );
 
       return {
@@ -69,47 +129,22 @@ class UserAuthService {
     }
   }
 
-  // Sign out
+  /// Sign out
   Future<void> signOut() async {
+    await _googleSignIn.signOut();
     await _auth.signOut();
   }
 
-  // Get user profile from Firestore
-  Future<Map<String, dynamic>?> getUserProfile(String uid) async {
-    try {
-      final doc = await _firestore.collection('users').doc(uid).get();
-      return doc.data();
-    } catch (e) {
-      debugPrint('Error getting user profile: $e');
-      return null;
-    }
-  }
-
-  // Check if user has completed registration (has Personal IIN)
+  /// Check if user has completed registration
   Future<bool> hasCompletedRegistration(String uid) async {
-    final profile = await getUserProfile(uid);
-    return profile != null && profile['personalIinId'] != null;
+    return await _onboardingService.isUserOnboarded(uid);
   }
 
-  // Check if user is onboarded, if not, run onboarding
-  Future<void> ensureUserOnboarded(String uid) async {
-    final isOnboarded = await _onboardingService.isUserOnboarded(uid);
-    if (!isOnboarded) {
-      debugPrint('User not onboarded, running onboarding for: $uid');
-      await _onboardingService.onboardExistingUser(uid);
-    }
+  /// Get user profile
+  Future<Map<String, dynamic>?> getUserProfile(String uid) async {
+    return await _onboardingService.getUserProfile(uid);
   }
 
-  // Send password reset email
-  Future<void> sendPasswordResetEmail(String email) async {
-    try {
-      await _auth.sendPasswordResetEmail(email: email.trim());
-    } on FirebaseAuthException catch (e) {
-      throw _handleAuthError(e);
-    }
-  }
-
-  // Handle Firebase Auth errors
   String _handleAuthError(FirebaseAuthException e) {
     switch (e.code) {
       case 'user-not-found':

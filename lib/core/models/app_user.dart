@@ -1,16 +1,16 @@
+// IAMONEAI - Fresh Start
 import 'package:cloud_firestore/cloud_firestore.dart';
 
 /// App User Model - Stored in /users/{uid}
-/// Base user profile for all users
 class AppUser {
   final String uid;
   final String email;
   final String? displayName;
   final String? firstName;
   final String? lastName;
-  final String? personalIinId; // Their personal IIN
-  final String status; // 'active', 'suspended', 'deleted'
-  final String role; // 'user', 'admin', 'super_admin', etc.
+  final String? personalIinId;
+  final String status;
+  final String role;
   final DateTime createdAt;
   final DateTime? updatedAt;
 

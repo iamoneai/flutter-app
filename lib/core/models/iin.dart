@@ -1,24 +1,14 @@
+// IAMONEAI - Fresh Start
 import 'package:cloud_firestore/cloud_firestore.dart';
 
-/// IIN Types
-enum IINOwnerType {
-  user,
-  entity,
-}
-
-enum IINTypeEnum {
-  personal,
-  entityBrain,
-  entityEmployee,
-}
-
 /// IIN Model - Stored in /iins/{iinId}
+/// Simplified: Only personal IIN type
 class IIN {
   final String iinId;
-  final String iinType; // 'personal', 'entity_brain', 'entity_employee'
-  final String ownerType; // 'user', 'entity'
-  final String ownerId; // uid or entityId
-  final String status; // 'active', 'suspended', 'deleted'
+  final String iinType;
+  final String ownerType;
+  final String ownerId;
+  final String status;
   final DateTime createdAt;
   final DateTime? updatedAt;
 
@@ -36,8 +26,8 @@ class IIN {
     final data = doc.data() as Map<String, dynamic>;
     return IIN(
       iinId: doc.id,
-      iinType: data['iinType'] ?? '',
-      ownerType: data['ownerType'] ?? '',
+      iinType: data['iinType'] ?? 'personal',
+      ownerType: data['ownerType'] ?? 'user',
       ownerId: data['ownerId'] ?? '',
       status: data['status'] ?? 'active',
       createdAt: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
@@ -57,7 +47,5 @@ class IIN {
   }
 
   bool get isPersonal => iinType == 'personal';
-  bool get isEntityBrain => iinType == 'entity_brain';
-  bool get isEntityEmployee => iinType == 'entity_employee';
   bool get isActive => status == 'active';
 }

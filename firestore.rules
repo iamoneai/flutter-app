@@ -1,10 +1,6 @@
-﻿rules_version = '2';
+rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-
-    // ============================================
-    // HELPER FUNCTIONS
-    // ============================================
 
     function isAuthenticated() {
       return request.auth != null;
@@ -21,103 +17,32 @@ service cloud.firestore {
       );
     }
 
-    function isAdmin() {
-      return isAuthenticated() &&
-        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['super_admin', 'admin'];
-    }
-
-    // ============================================
-    // SUPER ADMIN OVERRIDE - FULL ACCESS
-    // ============================================
+    // Super admin has full access
     match /{document=**} {
       allow read, write: if isSuperAdmin();
     }
 
-    // ============================================
-    // ADMIN COLLECTIONS
-    // ============================================
-
-    match /admin/config/{document=**} {
+    // Admin collection
+    match /admin/{document=**} {
       allow read: if isAuthenticated();
       allow write: if isSuperAdmin();
     }
 
-    match /admin/{document} {
-      allow read: if isAuthenticated();
-      allow write: if isSuperAdmin();
-    }
-
-    // ============================================
-    // USER COLLECTIONS
-    // ============================================
-
+    // User profiles
     match /users/{userId} {
-      allow read: if isOwner(userId) || isAdmin();
-      allow create: if isAuthenticated() && request.auth.uid == userId;
-      allow update: if isOwner(userId);
-      allow delete: if isOwner(userId) || isSuperAdmin();
+      allow read: if isAuthenticated();
+      allow write: if isOwner(userId) || isSuperAdmin();
     }
 
-    match /users/{userId}/{subcollection}/{docId} {
-      allow read, write: if isOwner(userId);
-    }
-
-    match /users/{userId}/chats/{chatId}/messages/{messageId} {
-      allow read, write: if isOwner(userId);
-    }
-
-    // ============================================
-    // IIN SYSTEM
-    // ============================================
-
+    // IINs
     match /iins/{iinId} {
       allow read: if isAuthenticated();
-      allow create: if isAuthenticated();
-      allow update, delete: if isAuthenticated();
+      allow write: if isAuthenticated();
     }
 
-    match /iin_access/{docId} {
-      allow read: if isAuthenticated();
-      allow create: if isAuthenticated();
-      allow update, delete: if isAuthenticated();
-    }
-
+    // User sessions
     match /user_sessions/{uid} {
-      allow read, write: if isOwner(uid);
-      allow create: if isAuthenticated() && request.auth.uid == uid;
-    }
-
-    // ============================================
-    // ENTITY SYSTEM
-    // ============================================
-
-    match /entities/{entityId} {
-      allow read: if isAuthenticated();
-      allow create: if isAuthenticated();
-      allow update, delete: if isAuthenticated();
-    }
-
-    match /entity_employees/{docId} {
-      allow read: if isAuthenticated();
-      allow create, update, delete: if isAuthenticated();
-    }
-
-    match /entity_invitations/{inviteId} {
-      allow read: if isAuthenticated();
-      allow create, update: if isAuthenticated();
-      allow delete: if isAuthenticated();
-    }
-
-    // ============================================
-    // CONVERSATIONS/MESSAGES
-    // ============================================
-    match /conversations/{conversationId} {
-      allow read, write: if isAuthenticated();
-    }
-
-    match /messages/{messageId} {
-      allow read, write: if isAuthenticated();
+      allow read, write: if isOwner(uid) || isSuperAdmin();
     }
   }
 }

@@ -8,6 +8,7 @@ import {
   QuickReply,
   createQuickRepliesAction,
 } from '../types/actions';
+import { getRecentSummaries, formatSummariesForContext } from './compression';
 
 const db = admin.firestore();
 const secretManager = new SecretManagerServiceClient();
@@ -63,6 +64,12 @@ interface LayerConfig {
     tokenBudget: number;
     maxEvents: number;
     format: 'list' | 'prose' | 'json';
+  };
+  // NEW: Past conversations from nightly compression
+  pastConversations: {
+    enabled: boolean;
+    maxDays: number;
+    tokenBudget: number;
   };
 }
 
@@ -228,16 +235,23 @@ async function getContextInjectionConfig(): Promise<ContextInjectionConfig> {
         maxEvents: data.layers?.calendar?.maxEvents ?? 10,
         format: data.layers?.calendar?.format ?? 'list',
       },
+      // NEW: Past conversations from nightly compression
+      pastConversations: {
+        enabled: data.layers?.pastConversations?.enabled ?? true,
+        maxDays: data.layers?.pastConversations?.maxDays ?? 7,
+        tokenBudget: data.layers?.pastConversations?.tokenBudget ?? 200,
+      },
     },
     promptStructure: {
       systemPromptTemplate: data.promptStructure?.systemPromptTemplate ?? defaultSystemPrompt,
       sectionHeaders: data.promptStructure?.sectionHeaders ?? {
         profile: 'USER PROFILE:',
         calendar: 'UPCOMING EVENTS:',
+        pastConversations: 'PAST CONVERSATIONS:',
         sessionSummary: 'SESSION CONTEXT:',
         immediate: 'RECENT CONVERSATION:',
       },
-      sectionOrder: data.promptStructure?.sectionOrder ?? ['profile', 'calendar', 'sessionSummary', 'immediate'],
+      sectionOrder: data.promptStructure?.sectionOrder ?? ['profile', 'calendar', 'pastConversations', 'sessionSummary', 'immediate'],
     },
     summaryLLM: {
       provider: data.summaryLLM?.provider ?? 'gemini',
@@ -856,7 +870,57 @@ async function buildLayer4Calendar(
 }
 
 /**
- * Assemble all 4 layers into final context
+ * LAYER 5 - PAST CONVERSATIONS: Get compressed summaries from nightly compression
+ */
+async function buildLayer5PastConversations(
+  iin: string,
+  config: LayerConfig['pastConversations']
+): Promise<LayerResult> {
+  if (!config.enabled) {
+    return { name: 'pastConversations', content: '', tokenCount: 0, itemCount: 0, trimmed: false };
+  }
+
+  try {
+    // Get summaries from the compression module
+    const summaries = await getRecentSummaries(iin, config.maxDays);
+
+    if (summaries.length === 0) {
+      console.log('[Layer 5 - Past Conversations] No compressed summaries available');
+      return { name: 'pastConversations', content: '', tokenCount: 0, itemCount: 0, trimmed: false };
+    }
+
+    // Format summaries for context
+    let content = formatSummariesForContext(summaries);
+
+    // Check token budget and trim if needed
+    let trimmed = false;
+    let finalSummaries = summaries;
+    if (estimateTokens(content) > config.tokenBudget) {
+      // Remove oldest summaries until within budget
+      while (finalSummaries.length > 1 && estimateTokens(content) > config.tokenBudget) {
+        finalSummaries = finalSummaries.slice(0, -1);
+        content = formatSummariesForContext(finalSummaries);
+        trimmed = true;
+      }
+    }
+
+    console.log(`[Layer 5 - Past Conversations] ${finalSummaries.length} day summaries, ${estimateTokens(content)} tokens${trimmed ? ' (trimmed)' : ''}`);
+
+    return {
+      name: 'pastConversations',
+      content,
+      tokenCount: estimateTokens(content),
+      itemCount: finalSummaries.length,
+      trimmed,
+    };
+  } catch (error) {
+    console.log('[Layer 5 - Past Conversations] Error fetching summaries:', error);
+    return { name: 'pastConversations', content: '', tokenCount: 0, itemCount: 0, trimmed: false };
+  }
+}
+
+/**
+ * Assemble all 5 layers into final context
  */
 async function assemble4LayerContext(
   input: {
@@ -881,18 +945,19 @@ async function assemble4LayerContext(
   const layers: LayerResult[] = [];
   const layerConfig = config.layers!;
 
-  // Build all 4 layers in parallel
-  const [layer1, layer2, layer3, layer4] = await Promise.all([
+  // Build all 5 layers in parallel
+  const [layer1, layer2, layer3, layer4, layer5] = await Promise.all([
     buildLayer1Immediate(input.iin, input.sessionId, input.sessionMessages, layerConfig.immediate),
     buildLayer2SessionSummary(input.iin, input.sessionId, input.sessionMessages, layerConfig.sessionSummary, config.summaryLLM),
     buildLayer3Profile(input.iin, input.message, input.memories, layerConfig.profile, config.filter, config.injection),
     buildLayer4Calendar(input.iin, layerConfig.calendar),
+    buildLayer5PastConversations(input.iin, layerConfig.pastConversations),
   ]);
 
-  layers.push(layer1, layer2, layer3, layer4);
+  layers.push(layer1, layer2, layer3, layer4, layer5);
 
   // Build assembled context according to section order
-  const sectionOrder = config.promptStructure?.sectionOrder || ['profile', 'calendar', 'sessionSummary', 'immediate'];
+  const sectionOrder = config.promptStructure?.sectionOrder || ['profile', 'calendar', 'pastConversations', 'sessionSummary', 'immediate'];
   const sectionHeaders = config.promptStructure?.sectionHeaders || {};
 
   const layerMap: Record<string, LayerResult> = {
@@ -900,6 +965,7 @@ async function assemble4LayerContext(
     sessionSummary: layer2,
     profile: layer3,
     calendar: layer4,
+    pastConversations: layer5,
   };
 
   const sections: string[] = [];

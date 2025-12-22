@@ -1,1292 +1,1788 @@
-import {onRequest} from "firebase-functions/v2/https";
-import {Request, Response} from "express";
-import * as admin from "firebase-admin";
-import Anthropic from "@anthropic-ai/sdk";
-import OpenAI from "openai";
-import cors from "cors";
-import {v4 as uuidv4} from "uuid";
+// IAMONEAI - Direct LLM Mode (Clean Restart)
+import { onRequest, Request } from 'firebase-functions/v2/https';
+import * as admin from 'firebase-admin';
+import { Response } from 'express';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
+import { SecretManagerServiceClient } from '@google-cloud/secret-manager';
+import { processDecisionPipeline } from './pipeline';
 
 admin.initializeApp();
 const db = admin.firestore();
-const corsHandler = cors({origin: true});
+const secretManager = new SecretManagerServiceClient();
 
-// ============================================
-// INTERFACES
-// ============================================
+// Secret cache
+const secretCache: Record<string, string> = {};
 
-interface ChatRequest {
-  message: string;
-  iin?: string;      // IAMONEAI Identity Number (preferred)
-  userId?: string;   // Firebase UID (backward compat)
-  userName?: string;
-  context?: "personal" | "work" | "family";
-  provider?: string; // "all" for smart router, or specific provider
-}
+// System prompt - Cloud Commander Mode
+const SYSTEM_PROMPT = `You are IAMONEAI, a personal AI assistant with memory capabilities.
 
-interface ChatResponse {
-  response: string;
-  provider: string;
-  model: string;
-  userName: string | null;
-  latency: number;
-  tokens: {
-    input: number;
-    output: number;
-    total: number;
-  };
-  debug: {
-    routingMethod: string;
-    matchedCategory: string | null;
-    categoryId: string | null;
-    primaryLLM: string | null;
-    fallbackLLM: string | null;
-    usedFallback: boolean;
-    restricted: string | null;
-    defaultProvider: string | null;
-    memoriesUsed: number;
-    memoryDetails?: any[]; // Memory objects for debug inspection
-    memoriesSaved: number;
-  };
-}
+IMPORTANT: You have access to the following TOOLS. When appropriate, output a JSON command instead of plain text.
 
-interface MemoryRequest {
-  iin?: string;      // IAMONEAI Identity Number (preferred)
-  userId?: string;   // Firebase UID (backward compat)
-  content: string;
-  type?: "fact" | "opinion" | "belief" | "episodic";
-  context?: "personal" | "work" | "family";
-  importance?: number;
-}
+## AVAILABLE TOOLS:
 
-interface Memory {
-  id: string;
-  userId: string;
-  content: string;
-  type: string;
-  context: string;
-  importance: number;
-  createdAt: admin.firestore.Timestamp;
-}
+### SAVE_MEMORY
+Use this when the user shares personal information, preferences, facts about themselves, or anything worth remembering.
+Output format:
+\`\`\`json
+{"tool": "SAVE_MEMORY", "params": {"content": "the fact to remember", "tags": ["tag1", "tag2"], "category": "personal|work|health|hobby|relationship", "sentiment": "positive|neutral|negative"}}
+\`\`\`
 
-interface ApiKeys {
-  claude?: string;
-  openai?: string;
-  gemini?: string;
-}
+### GET_MEMORIES
+Use this when the user asks "what do you know about me" or similar.
+Output format:
+\`\`\`json
+{"tool": "GET_MEMORIES", "params": {"limit": 10}}
+\`\`\`
 
-interface Category {
-  id: string;
-  name: string;
-  displayName?: string;
-  keywords: string[];
-  primaryLLM: string;
-  fallbackLLM: string;
-  priority?: number;
-  isActive?: boolean;
-  system_prompt?: string;
-}
+## RULES:
+1. For casual conversation (greetings, questions, jokes), respond normally with text.
+2. When user shares a personal fact like "I love tacos" or "My dog's name is Max", you MUST output ONLY the JSON tool command, nothing else.
+3. After the app executes the tool, it will show the user a confirmation message.
+4. Keep memories concise and factual.
+5. Extract relevant tags and sentiment from the context.
 
-interface LLMConfig {
-  claude?: { model: string; max_tokens: number };
-  openai?: { model: string; max_tokens: number };
-  gemini?: { model: string; max_tokens: number };
-  default_provider?: string;
-}
+## EXAMPLES:
 
-interface GlobalSettings {
-  guardrails?: {
-    blocked_domains?: string[];
-    restricted_domains?: string[];
-    restricted_domain_disclaimer?: string;
-  };
-  response?: {
-    default_style?: string;
-  };
-}
+User: "Hello!"
+Response: "Hello! How can I help you today?"
 
-interface InfrastructureConfig {
-  vertexai?: {
-    project_id?: string;
-    region?: string;
-    index_id?: string;
-    index_endpoint_id?: string;
-    deployed_index_id?: string;
-    embedding_model?: string;
-    enabled?: boolean;
-    public_domain?: string;
-  };
-}
+User: "I love hiking on weekends"
+Response:
+\`\`\`json
+{"tool": "SAVE_MEMORY", "params": {"content": "User loves hiking on weekends", "tags": ["hiking", "weekend", "hobby"], "category": "hobby", "sentiment": "positive"}}
+\`\`\`
 
-// ============================================
-// LLM NAME MAPPING
-// Maps category LLM names to provider and model
-// ============================================
+User: "What do you remember about me?"
+Response:
+\`\`\`json
+{"tool": "GET_MEMORIES", "params": {"limit": 10}}
+\`\`\`
+`;
 
-const LLM_MAPPING: Record<string, { provider: string; model: string }> = {
-  // Claude models
-  "claude-sonnet": { provider: "claude", model: "claude-3-5-sonnet-20241022" },
-  "claude-haiku": { provider: "claude", model: "claude-3-5-haiku-20241022" },
-  "claude-opus": { provider: "claude", model: "claude-3-opus-20240229" },
-  // OpenAI models
-  "gpt-4o": { provider: "openai", model: "gpt-4o" },
-  "gpt-4o-mini": { provider: "openai", model: "gpt-4o-mini" },
-  "gpt-4-turbo": { provider: "openai", model: "gpt-4-turbo" },
-  "gpt-4": { provider: "openai", model: "gpt-4" },
-  "gpt-3.5-turbo": { provider: "openai", model: "gpt-3.5-turbo" },
-  // Gemini models
-  "gemini-pro": { provider: "gemini", model: "gemini-1.5-pro" },
-  "gemini-flash": { provider: "gemini", model: "gemini-2.0-flash-exp" },
-  "gemini-1.5-pro": { provider: "gemini", model: "gemini-1.5-pro" },
-  "gemini-1.5-flash": { provider: "gemini", model: "gemini-1.5-flash" },
-  "gemini-2.0-flash-exp": { provider: "gemini", model: "gemini-2.0-flash-exp" },
-};
-
-// Normalize LLM name to provider key
-function normalizeLLMName(name: string): string {
-  if (!name) return "claude";
-  
-  // Check our mapping first
-  if (LLM_MAPPING[name]) {
-    return LLM_MAPPING[name].provider;
+/**
+ * Get secret from Secret Manager (with caching)
+ */
+async function getSecret(name: string): Promise<string> {
+  if (secretCache[name]) {
+    return secretCache[name];
   }
-  
-  // Fallback detection
-  const lower = name.toLowerCase();
-  if (lower.includes("claude")) return "claude";
-  if (lower.includes("gpt") || lower.includes("openai")) return "openai";
-  if (lower.includes("gemini")) return "gemini";
-  
-  return "claude"; // Default
-}
 
-// Get model name from LLM name
-function getModelFromLLMName(llmName: string, llmConfig: LLMConfig): string {
-  // Check our mapping first
-  if (LLM_MAPPING[llmName]) {
-    return LLM_MAPPING[llmName].model;
-  }
-  
-  // Fallback to config
-  const provider = normalizeLLMName(llmName);
-  if (provider === "claude") return llmConfig.claude?.model || "claude-3-haiku-20240307";
-  if (provider === "openai") return llmConfig.openai?.model || "gpt-4o-mini";
-  if (provider === "gemini") return llmConfig.gemini?.model || "gemini-2.0-flash-exp";
-  
-  return "claude-3-haiku-20240307";
-}
-
-// ============================================
-// CONFIG LOADERS (FROM FIRESTORE)
-// ============================================
-
-async function getApiKeys(): Promise<ApiKeys> {
-  try {
-    const doc = await db.collection("admin").doc("api_keys").get();
-    if (!doc.exists) return {};
-    const data = doc.data();
-    return {
-      claude: data?.anthropic?.key,
-      openai: data?.openai?.key,
-      gemini: data?.google?.key,
-    };
-  } catch (error) {
-    console.error("Error getting API keys:", error);
-    return {};
-  }
-}
-
-async function getLLMConfig(): Promise<LLMConfig> {
-  try {
-    const doc = await db.collection("admin").doc("config")
-      .collection("settings").doc("llm").get();
-    if (!doc.exists) {
-      return {
-        claude: { model: "claude-3-haiku-20240307", max_tokens: 1024 },
-        openai: { model: "gpt-4o-mini", max_tokens: 1024 },
-        gemini: { model: "gemini-2.0-flash-exp", max_tokens: 1024 },
-        default_provider: "claude"
-      };
-    }
-    return doc.data() as LLMConfig;
-  } catch (error) {
-    console.error("Error getting LLM config:", error);
-    return {};
-  }
-}
-
-async function getCategories(): Promise<Category[]> {
-  try {
-    const snapshot = await db.collection("admin").doc("config")
-      .collection("categories").orderBy("priority").get();
-    const categories = snapshot.docs
-      .map((doc: admin.firestore.QueryDocumentSnapshot) => ({id: doc.id, ...doc.data()} as Category))
-      .filter((c: Category) => c.isActive !== false);
-    console.log(`Loaded ${categories.length} active categories`);
-    return categories;
-  } catch (error) {
-    console.error("Error getting categories:", error);
-    return [];
-  }
-}
-
-async function getGlobalSettings(): Promise<GlobalSettings> {
-  try {
-    const doc = await db.collection("admin").doc("config")
-      .collection("settings").doc("global").get();
-    if (!doc.exists) return {};
-    return doc.data() as GlobalSettings;
-  } catch (error) {
-    console.error("Error getting global settings:", error);
-    return {};
-  }
-}
-
-async function getInfrastructureConfig(): Promise<InfrastructureConfig> {
-  try {
-    const doc = await db.collection("admin").doc("config")
-      .collection("settings").doc("infrastructure").get();
-    if (!doc.exists) return {};
-    return doc.data() as InfrastructureConfig;
-  } catch (error) {
-    console.error("Error getting infrastructure config:", error);
-    return {};
-  }
-}
-
-async function getUserProfile(uid: string): Promise<{firstName?: string; displayName?: string} | null> {
-  try {
-    const doc = await db.collection("users").doc(uid).get();
-    if (!doc.exists) return null;
-    return doc.data() as {firstName?: string; displayName?: string};
-  } catch (error) {
-    console.error("Error getting user profile:", error);
-    return null;
-  }
-}
-
-// Helper: Resolve IIN to Firebase UID
-async function resolveIINtoUID(iin: string): Promise<string | null> {
-  try {
-    const snapshot = await db.collection("users").where("iin", "==", iin).limit(1).get();
-    if (snapshot.empty) return null;
-    return snapshot.docs[0].id;
-  } catch (error) {
-    console.error("Error resolving IIN to UID:", error);
-    return null;
-  }
-}
-
-// ============================================
-// SMART ROUTER - CATEGORY MATCHING
-// ============================================
-
-function matchCategory(message: string, categories: Category[]): Category | null {
-  const lowerMessage = message.toLowerCase();
-  
-  // Categories already sorted by priority from Firestore
-  for (const category of categories) {
-    if (!category.keywords || !Array.isArray(category.keywords)) continue;
-    for (const keyword of category.keywords) {
-      if (lowerMessage.includes(keyword.toLowerCase())) {
-        console.log(`Matched category: ${category.displayName || category.name} (keyword: "${keyword}")`);
-        return category;
-      }
-    }
-  }
-  
-  // Fallback to simple_chat if exists
-  const simpleChat = categories.find((c) => c.id === "simple_chat");
-  if (simpleChat) {
-    console.log("No keyword match, using simple_chat category");
-    return simpleChat;
-  }
-  
-  console.log("No category matched");
-  return null;
-}
-
-function checkGuardrails(message: string, settings: GlobalSettings): {
-  blocked: boolean;
-  restricted: boolean;
-  domain: string | null;
-  disclaimer: string | null;
-} {
-  const lowerMessage = message.toLowerCase();
-  const blocked = settings.guardrails?.blocked_domains || [];
-  const restricted = settings.guardrails?.restricted_domains || [];
-  const disclaimer = settings.guardrails?.restricted_domain_disclaimer || "";
-
-  console.log("Guardrails check - Blocked domains:", blocked);
-  console.log("Guardrails check - Restricted domains:", restricted);
-  console.log("Guardrails check - Message:", lowerMessage);
-
-  for (const domain of blocked) {
-    if (lowerMessage.includes(domain.toLowerCase())) {
-      console.log(`BLOCKED: Message contains blocked domain "${domain}"`);
-      return {blocked: true, restricted: false, domain, disclaimer: null};
-    }
-  }
-  
-  for (const domain of restricted) {
-    if (lowerMessage.includes(domain.toLowerCase())) {
-      console.log(`RESTRICTED: Message contains restricted domain "${domain}"`);
-      return {
-        blocked: false, 
-        restricted: true, 
-        domain,
-        disclaimer: disclaimer.replace("{domain}", domain)
-      };
-    }
-  }
-  
-  console.log("Guardrails check - PASSED (no matches)");
-  return {blocked: false, restricted: false, domain: null, disclaimer: null};
-}
-
-// ============================================
-// EMBEDDING FUNCTIONS
-// ============================================
-
-async function generateEmbedding(text: string, apiKey: string, model: string): Promise<number[]> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent?key=${apiKey}`;
-  
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      model: `models/${model}`,
-      content: {parts: [{text}]},
-    }),
+  const projectId = process.env.GCLOUD_PROJECT || 'app-iamoneai-c36ec';
+  const [version] = await secretManager.accessSecretVersion({
+    name: `projects/${projectId}/secrets/${name}/versions/latest`,
   });
 
-  const data: { error?: { message?: string }; embedding?: { values?: number[] } } = await response.json();
-  if (data.error) {
-    throw new Error(data.error.message || "Embedding API error");
-  }
-  
-  return data.embedding?.values || [];
+  const payload = version.payload?.data?.toString() || '';
+  secretCache[name] = payload;
+  return payload;
 }
 
-// ============================================
-// MEMORY FUNCTIONS
-// ============================================
-
-interface SaveMemoryParams {
-  userId: string;  // Required for saving
-  content: string;
-  type?: "fact" | "opinion" | "belief" | "episodic";
-  context?: "personal" | "work" | "family";
-  importance?: number;
-}
-
-async function saveMemoryToFirestore(
-  memory: SaveMemoryParams,
-  apiKey: string,
-  infraConfig: InfrastructureConfig
-): Promise<string> {
-  const memoryId = uuidv4();
-  const embeddingModel = infraConfig.vertexai?.embedding_model || "text-embedding-004";
-  
-  // Generate embedding
-  let embedding: number[] = [];
-  try {
-    embedding = await generateEmbedding(memory.content, apiKey, embeddingModel);
-  } catch (e) {
-    console.error("Embedding generation failed:", e);
-  }
-  
-  // Save to Firestore
-  const memoryDoc = {
-    id: memoryId,
-    userId: memory.userId,
-    content: memory.content,
-    type: memory.type || "fact",
-    context: memory.context || "personal",
-    importance: memory.importance || 0.5,
-    createdAt: admin.firestore.Timestamp.now(),
-    embeddingSize: embedding.length,
+/**
+ * Brain Config interface - SIMPLIFIED
+ * Core settings stored in config/brain
+ * Classifier config is now at config/pipeline/stages/classifier
+ */
+interface BrainConfig {
+  defaultLLM: string;
+  temperature: number;
+  maxTokens: number;
+  memory: {
+    saveEnabled: boolean;
+    injectEnabled: boolean;
   };
-  
-  await db.collection("users").doc(memory.userId)
-    .collection("memories").doc(memoryId).set(memoryDoc);
-  
-  // Upsert to Vertex AI if configured
-  console.log("Vector upsert check:", { enabled: infraConfig.vertexai?.enabled, embeddingLength: embedding.length });
-  if (infraConfig.vertexai?.enabled && embedding.length > 0) {
+  system: {
+    chatEnabled: boolean;
+    loggingLevel: string;
+  };
+  debugMode: boolean;
+}
+
+/**
+ * Get brain config from Firestore - SIMPLIFIED
+ * Core settings only. Classifier is at config/pipeline/stages/classifier
+ */
+async function getBrainConfig(): Promise<BrainConfig> {
+  // Safe defaults
+  const defaults: BrainConfig = {
+    defaultLLM: 'gemini',
+    temperature: 0.7,
+    maxTokens: 1024,
+    memory: {
+      saveEnabled: true,
+      injectEnabled: true,
+    },
+    system: {
+      chatEnabled: true,
+      loggingLevel: 'info',
+    },
+    debugMode: false,
+  };
+
+  try {
+    const doc = await db.doc('config/brain').get();
+
+    if (!doc.exists) {
+      console.log('[CONFIG] No config found at config/brain, using defaults');
+      return defaults;
+    }
+
+    const data = doc.data() || {};
+    const memory = data.memory || {};
+    const system = data.system || {};
+
+    // Support both new flat structure and legacy nested structure
+    let defaultLLM = defaults.defaultLLM;
+    let temperature = defaults.temperature;
+    let maxTokens = defaults.maxTokens;
+
+    // New flat structure
+    if (data.defaultLLM) {
+      defaultLLM = data.defaultLLM;
+    }
+    // Legacy: routing.defaultLLM
+    else if (data.routing?.defaultLLM) {
+      defaultLLM = data.routing.defaultLLM;
+    }
+
+    // New flat structure
+    if (data.temperature !== undefined) {
+      temperature = data.temperature;
+    }
+    // Legacy: llm.temperature
+    else if (data.llm?.temperature !== undefined) {
+      temperature = data.llm.temperature;
+    }
+
+    // New flat structure
+    if (data.maxTokens !== undefined) {
+      maxTokens = data.maxTokens;
+    }
+    // Legacy: llm.maxTokens
+    else if (data.llm?.maxTokens !== undefined) {
+      maxTokens = data.llm.maxTokens;
+    }
+
+    const config: BrainConfig = {
+      defaultLLM,
+      temperature,
+      maxTokens,
+      memory: {
+        saveEnabled: memory.saveEnabled ?? defaults.memory.saveEnabled,
+        injectEnabled: memory.injectEnabled ?? defaults.memory.injectEnabled,
+      },
+      system: {
+        chatEnabled: system.chatEnabled ?? defaults.system.chatEnabled,
+        loggingLevel: system.loggingLevel ?? defaults.system.loggingLevel,
+      },
+      debugMode: data.debugMode ?? defaults.debugMode,
+    };
+
+    console.log(`[CONFIG] Loaded from config/brain: defaultLLM=${config.defaultLLM}, temp=${config.temperature}, chatEnabled=${config.system.chatEnabled}`);
+    return config;
+  } catch (error) {
+    console.error('[CONFIG] Error loading config:', error);
+    return defaults;
+  }
+}
+
+/**
+ * Call Gemini
+ */
+async function callGemini(
+  message: string,
+  temperature: number,
+  maxTokens: number
+): Promise<{ text: string; inputTokens: number; outputTokens: number }> {
+  const apiKey = await getSecret('gemini-api-key');
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-2.0-flash-exp',
+    systemInstruction: SYSTEM_PROMPT,
+    generationConfig: {
+      temperature,
+      maxOutputTokens: maxTokens,
+    },
+  });
+
+  const result = await model.generateContent(message);
+  const response = result.response;
+
+  return {
+    text: response.text(),
+    inputTokens: response.usageMetadata?.promptTokenCount || 0,
+    outputTokens: response.usageMetadata?.candidatesTokenCount || 0,
+  };
+}
+
+/**
+ * Call Claude
+ */
+async function callClaude(
+  message: string,
+  maxTokens: number
+): Promise<{ text: string; inputTokens: number; outputTokens: number }> {
+  const apiKey = await getSecret('anthropic-api-key');
+  const anthropic = new Anthropic({ apiKey });
+
+  const response = await anthropic.messages.create({
+    model: 'claude-3-haiku-20240307',
+    max_tokens: maxTokens,
+    system: SYSTEM_PROMPT,
+    messages: [{ role: 'user', content: message }],
+  });
+
+  const textBlock = response.content.find(block => block.type === 'text');
+  const text = textBlock?.type === 'text' ? textBlock.text : '';
+
+  return {
+    text,
+    inputTokens: response.usage.input_tokens,
+    outputTokens: response.usage.output_tokens,
+  };
+}
+
+/**
+ * Call GPT
+ */
+async function callGPT(
+  message: string,
+  temperature: number,
+  maxTokens: number
+): Promise<{ text: string; inputTokens: number; outputTokens: number }> {
+  const apiKey = await getSecret('openai-api-key');
+  const openai = new OpenAI({ apiKey });
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature,
+    max_tokens: maxTokens,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: message },
+    ],
+  });
+
+  return {
+    text: response.choices[0]?.message?.content || '',
+    inputTokens: response.usage?.prompt_tokens || 0,
+    outputTokens: response.usage?.completion_tokens || 0,
+  };
+}
+
+/**
+ * Health check endpoint
+ */
+export const health = onRequest(async (req: Request, res: Response) => {
+  const config = await getBrainConfig();
+
+  res.json({
+    status: 'ok',
+    project: 'iamoneai',
+    version: 'simplified-config',
+    configSource: 'config/brain',
+    config: {
+      defaultLLM: config.defaultLLM,
+      temperature: config.temperature,
+      maxTokens: config.maxTokens,
+      memory: config.memory,
+      system: config.system,
+      debugMode: config.debugMode,
+    },
+    classifierSource: 'config/pipeline/stages/classifier',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * Chat endpoint - Direct LLM (no memory)
+ */
+export const chat = onRequest(
+  { memory: '512MiB', timeoutSeconds: 120 },
+  async (req: Request, res: Response) => {
+    // CORS
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.status(405).json({ text: 'Method not allowed' });
+      return;
+    }
+
+    const { message } = req.body;
+    const startTime = Date.now();
+
+    // Validate
+    if (!message) {
+      res.status(400).json({ text: 'Message is required' });
+      return;
+    }
+
     try {
-      await upsertToVectorIndex(memoryId, embedding, memory.userId, infraConfig);
-    } catch (e) {
-      console.error("Vector upsert failed (memory still saved):", e);
+      // Get brain config - SINGLE SOURCE OF TRUTH for all settings
+      const config = await getBrainConfig();
+
+      // Get classifier config (from Inference Pipeline)
+      const classifierConfig = await getClassifierConfig();
+
+      // Check if chat is enabled (kill switch)
+      if (!config.system.chatEnabled) {
+        res.json({ text: 'Chat is currently disabled.' });
+        return;
+      }
+
+      // Preprocess message for classification
+      const preprocessed = message.trim().replace(/\s+/g, ' ');
+
+      // Run intent classification (SAME as admin testClassifier endpoint)
+      const { scores, matchedKeywords, method } = calculateIntentScores(preprocessed, classifierConfig);
+
+      // Find highest scoring intent
+      let detectedIntent = classifierConfig.fallbackIntent;
+      let maxConfidence = 0;
+      Object.entries(scores).forEach(([intent, score]) => {
+        if (score > maxConfidence) {
+          maxConfidence = score;
+          detectedIntent = intent;
+        }
+      });
+
+      // Check if confidence meets threshold
+      const fallbackUsed = maxConfidence < classifierConfig.minConfidenceThreshold;
+      if (fallbackUsed) {
+        detectedIntent = classifierConfig.fallbackIntent;
+      }
+
+      // Use defaultLLM from config (simplified - no intent-based routing)
+      const provider = config.defaultLLM as 'gemini' | 'claude' | 'gpt';
+      const routingReason = `defaultLLM → ${provider}`;
+
+      const temperature = config.temperature;
+      const maxTokens = config.maxTokens;
+
+      console.log(`[CLASSIFIER] intent=${detectedIntent} confidence=${maxConfidence.toFixed(2)} fallback=${fallbackUsed} keywords=[${matchedKeywords.join(',')}]`);
+      console.log(`[ROUTING] ${routingReason}`);
+      console.log(`[CHAT] provider=${provider} message="${message.substring(0, 50)}..."`);
+
+      // Call LLM directly using defaultLLM
+      let result: { text: string; inputTokens: number; outputTokens: number };
+
+      switch (provider) {
+        case 'claude':
+          result = await callClaude(message, maxTokens);
+          break;
+        case 'gpt':
+          result = await callGPT(message, temperature, maxTokens);
+          break;
+        case 'gemini':
+        default:
+          result = await callGemini(message, temperature, maxTokens);
+          break;
+      }
+
+      const latencyMs = Date.now() - startTime;
+      console.log(`[CHAT] latency=${latencyMs}ms tokens=${result.inputTokens}/${result.outputTokens}`);
+
+      // Run the Decision Pipeline for memory analysis
+      const pipelineResult = processDecisionPipeline(message, {
+        defaultLLM: config.defaultLLM,
+        classifierConfidenceThreshold: classifierConfig.minConfidenceThreshold,
+        debugMode: config.debugMode,
+        memory: config.memory,
+        trust: { provisionalThreshold: 0.5 }, // Configured in Inference Pipeline
+      });
+
+      // Use the SAME classifier values for the response (matches admin testClassifier)
+      const classifierScore = maxConfidence;
+      const classifierDecision = fallbackUsed ? 'fallback' : 'direct';
+      const finalIntent = detectedIntent;
+
+      console.log(`[CLASSIFIER] score=${classifierScore} decision=${classifierDecision} intent=${finalIntent}`);
+      console.log(`[PIPELINE] outcome=${pipelineResult.pipeline.finalOutcome} stopReason=${pipelineResult.pipeline.stopReason || 'none'} latency=${pipelineResult.pipeline.totalLatencyMs}ms`);
+
+      // ALWAYS return comprehensive debug info
+      const response: Record<string, unknown> = {
+        text: result.text,
+        provider,
+        latencyMs,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        // Always include execution details
+        execution: {
+          provider: provider,
+          defaultLLM: config.defaultLLM,
+          temperature: temperature,
+          maxTokens: maxTokens,
+          timestamp: new Date().toISOString(),
+        },
+        // Classifier decision info (matches admin testClassifier format)
+        classifier: {
+          score: classifierScore,
+          decision: classifierDecision,
+          finalIntent: finalIntent,
+          allScores: scores,
+          matchedKeywords: matchedKeywords,
+          method: method,
+          fallbackUsed: fallbackUsed,
+          threshold: classifierConfig.minConfidenceThreshold,
+        },
+        // Routing decision
+        routing: {
+          selectedLLM: provider,
+          reason: routingReason,
+        },
+        // Config from config/brain (simplified)
+        config: {
+          defaultLLM: config.defaultLLM,
+          temperature: config.temperature,
+          maxTokens: config.maxTokens,
+          memory: config.memory,
+          system: config.system,
+          debugMode: config.debugMode,
+        },
+        // Include full decision pipeline when debugMode is true
+        decisionPipeline: config.debugMode ? pipelineResult.pipeline : undefined,
+      };
+
+      res.json(response);
+
+    } catch (error) {
+      console.error('[CHAT] Error:', error);
+      res.json({ text: "Sorry, I couldn't answer that right now." });
     }
   }
-  
-  return memoryId;
+);
+
+/**
+ * Input Analysis Config interface
+ */
+interface InputAnalysisConfig {
+  tokenLimitEnabled: boolean;
+  maxTokens: number;
+  preprocessingEnabled: boolean;
+  stripWhitespace: boolean;
+  lowercaseNormalize: boolean;
+  languageDetectionEnabled: boolean;
+  detectedLanguages: string[];
 }
 
-async function upsertToVectorIndex(
-  id: string,
-  embedding: number[],
-  userId: string,
-  infraConfig: InfrastructureConfig
-): Promise<void> {
-  const region = infraConfig.vertexai?.region || "us-central1";
-  const projectId = infraConfig.vertexai?.project_id || "app-iamoneai-c36ec";
-  const indexId = infraConfig.vertexai?.index_id;
+/**
+ * Get Input Analysis config from Firestore
+ */
+async function getInputAnalysisConfig(): Promise<InputAnalysisConfig> {
+  const defaults: InputAnalysisConfig = {
+    tokenLimitEnabled: true,
+    maxTokens: 2048,
+    preprocessingEnabled: true,
+    stripWhitespace: true,
+    lowercaseNormalize: false,
+    languageDetectionEnabled: true,
+    detectedLanguages: ['en', 'es'],
+  };
 
-  if (!indexId) {
-    console.log("Missing index_id config; skipping vector upsert");
+  try {
+    const doc = await db.collection('config').doc('pipeline').collection('stages').doc('inputAnalysis').get();
+
+    if (!doc.exists) {
+      console.log('[INPUT-ANALYSIS] No config found, using defaults');
+      return defaults;
+    }
+
+    const data = doc.data() || {};
+    return {
+      tokenLimitEnabled: data.tokenLimitEnabled ?? defaults.tokenLimitEnabled,
+      maxTokens: data.maxTokens ?? defaults.maxTokens,
+      preprocessingEnabled: data.preprocessingEnabled ?? defaults.preprocessingEnabled,
+      stripWhitespace: data.stripWhitespace ?? defaults.stripWhitespace,
+      lowercaseNormalize: data.lowercaseNormalize ?? defaults.lowercaseNormalize,
+      languageDetectionEnabled: data.languageDetectionEnabled ?? defaults.languageDetectionEnabled,
+      detectedLanguages: data.detectedLanguages ?? defaults.detectedLanguages,
+    };
+  } catch (error) {
+    console.error('[INPUT-ANALYSIS] Error loading config:', error);
+    return defaults;
+  }
+}
+
+/**
+ * Simple token count estimation (approximation: 1 token ≈ 4 chars)
+ */
+function estimateTokenCount(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+/**
+ * Detect language using simple heuristics
+ */
+function detectLanguage(text: string): { code: string; confidence: number } {
+  const lowerText = text.toLowerCase();
+
+  // Spanish indicators
+  const spanishWords = ['hola', 'como', 'está', 'gracias', 'buenos', 'días', 'qué', 'sí', 'no sé'];
+  const spanishCount = spanishWords.filter(w => lowerText.includes(w)).length;
+
+  // French indicators
+  const frenchWords = ['bonjour', 'merci', 'comment', 'oui', 'non', 'très', 'bien', "c'est"];
+  const frenchCount = frenchWords.filter(w => lowerText.includes(w)).length;
+
+  // German indicators
+  const germanWords = ['guten', 'danke', 'bitte', 'ja', 'nein', 'wie', 'ist', 'nicht'];
+  const germanCount = germanWords.filter(w => lowerText.includes(w)).length;
+
+  if (spanishCount >= 2) return { code: 'es', confidence: 0.8 };
+  if (frenchCount >= 2) return { code: 'fr', confidence: 0.8 };
+  if (germanCount >= 2) return { code: 'de', confidence: 0.8 };
+
+  // Default to English
+  return { code: 'en', confidence: 0.9 };
+}
+
+/**
+ * Test Input Analysis endpoint
+ * Tests Stage 1 of the Inference Pipeline
+ */
+export const testInputAnalysis = onRequest(async (req: Request, res: Response) => {
+  // CORS
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.status(204).send('');
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+
+  const { message } = req.body;
+  const startTime = Date.now();
+
+  if (!message || typeof message !== 'string') {
+    res.status(400).json({ error: 'Message is required' });
     return;
   }
 
   try {
-    const {GoogleAuth} = await import("google-auth-library");
-    const auth = new GoogleAuth();
-    const accessToken = await auth.getAccessToken();
+    // Load configuration
+    const config = await getInputAnalysisConfig();
+    console.log('[INPUT-ANALYSIS] Config loaded:', JSON.stringify(config));
 
-    const url = `https://${region}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${region}/indexes/${indexId}:upsertDatapoints`;
-
-    console.log(`Upserting datapoint ${id} to index: ${indexId}`);
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
+    // Start analysis
+    const analysis: Record<string, unknown> = {
+      stage: 'Input Analysis',
+      stageNumber: 1,
+      input: {
+        raw: message,
+        length: message.length,
       },
-      body: JSON.stringify({
-        datapoints: [{
-          datapointId: id,
-          featureVector: embedding,
-          restricts: [{namespace: "userId", allowList: [userId]}],
-        }],
-      }),
-    });
+      config: config,
+    };
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("Vector upsert HTTP error:", response.status, errorText);
-      throw new Error(`Vector upsert failed: ${response.status}`);
-    }
+    // Token analysis
+    const estimatedTokens = estimateTokenCount(message);
+    const tokenLimitExceeded = config.tokenLimitEnabled && estimatedTokens > config.maxTokens;
 
-    console.log(`SUCCESS: Datapoint ${id} upserted to index ${indexId}`);
-  } catch (error) {
-    console.error("Vector upsert error:", error);
-    throw error;
-  }
-}
+    analysis.tokens = {
+      estimated: estimatedTokens,
+      limit: config.maxTokens,
+      limitEnabled: config.tokenLimitEnabled,
+      exceeded: tokenLimitExceeded,
+    };
 
-async function searchMemories(
-  query: string,
-  userId: string,
-  apiKey: string,
-  infraConfig: InfrastructureConfig,
-  limit = 5
-): Promise<Memory[]> {
-  console.log("searchMemories called:", { userId, query: query.substring(0, 50), limit });
-  console.log("Vertex AI config:", { 
-    enabled: infraConfig.vertexai?.enabled, 
-    hasEndpoint: !!infraConfig.vertexai?.index_endpoint_id 
-  });
-  
-  // If Vertex AI not configured, fall back to recent memories
-  if (!infraConfig.vertexai?.enabled || !infraConfig.vertexai?.index_endpoint_id) {
-    console.log("Vertex AI not configured, using getRecentMemories fallback");
-    return getRecentMemories(userId, limit);
-  }
-  
-  const embeddingModel = infraConfig.vertexai.embedding_model || "text-embedding-004";
-  const queryEmbedding = await generateEmbedding(query, apiKey, embeddingModel);
-  
-  const publicDomain = infraConfig.vertexai.public_domain;
-  const indexId = infraConfig.vertexai.deployed_index_id;
-  const projectId = infraConfig.vertexai.project_id || "app-iamoneai-c36ec";
-  const region = infraConfig.vertexai.region || "us-central1";
-  const endpointId = infraConfig.vertexai.index_endpoint_id;
-  
-  if (!publicDomain || !indexId) {
-    console.log("Missing public_domain or deployed_index_id, falling back to recent");
-    return getRecentMemories(userId, limit);
-  }
-  
-  try {
-    const {GoogleAuth} = await import("google-auth-library");
-    const auth = new GoogleAuth();
-    const accessToken = await auth.getAccessToken();
-    
-    const url = `https://${publicDomain}/v1/projects/${projectId}/locations/${region}/indexEndpoints/${endpointId}:findNeighbors`;
-    
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        deployed_index_id: indexId,
-        queries: [{
-          datapoint: { feature_vector: queryEmbedding },
-          neighbor_count: limit,
-        }],
-      }),
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("Vector search HTTP error:", response.status, errorText);
-      throw new Error(`Vector search failed: ${response.status} ${errorText}`);
-    }
-    
-    const data: { nearestNeighbors?: Array<{ neighbors?: Array<{ datapoint?: { datapointId?: string } }> }> } = await response.json();
-    console.log("Vector search raw response:", JSON.stringify(data).substring(0, 500));
+    // Preprocessing
+    let processedText = message;
+    const preprocessingSteps: string[] = [];
 
-    const neighbors = data.nearestNeighbors?.[0]?.neighbors || [];
-    const memoryIds = neighbors
-      .map((n) => n.datapoint?.datapointId)
-      .filter((id): id is string => Boolean(id));
-    
-    console.log("Vector matches found:", memoryIds.length, memoryIds);
+    if (config.preprocessingEnabled) {
+      // Strip outer quotes first
+      if ((processedText.startsWith('"') && processedText.endsWith('"')) ||
+          (processedText.startsWith("'") && processedText.endsWith("'"))) {
+        processedText = processedText.slice(1, -1);
+        preprocessingSteps.push('stripQuotes');
+      }
 
-    if (memoryIds.length === 0) {
-      console.log("No vector matches, falling back to recent");
-      return getRecentMemories(userId, limit);
-    }
-    
-    // Fetch full memories from Firestore
-    const memories: Memory[] = [];
-    for (const memId of memoryIds) {
-      const doc = await db.collection("users").doc(userId)
-        .collection("memories").doc(memId).get();
-      if (doc.exists) {
-        memories.push(doc.data() as Memory);
+      if (config.stripWhitespace) {
+        const beforeLength = processedText.length;
+        processedText = processedText.replace(/\s+/g, ' ').trim();
+        if (processedText.length !== beforeLength) {
+          preprocessingSteps.push('stripWhitespace');
+        }
+      }
+
+      if (config.lowercaseNormalize) {
+        processedText = processedText.toLowerCase();
+        preprocessingSteps.push('lowercaseNormalize');
       }
     }
-    
-    return memories;
-  } catch (error) {
-    console.error("Vector search error, falling back to recent:", error);
-    return getRecentMemories(userId, limit);
-  }
-}
 
-async function getRecentMemories(userId: string, limit: number): Promise<Memory[]> {
-  const snapshot = await db.collection("users").doc(userId)
-    .collection("memories")
-    .orderBy("createdAt", "desc")
-    .limit(limit)
-    .get();
-  return snapshot.docs.map((doc: admin.firestore.QueryDocumentSnapshot) => doc.data() as Memory);
-}
+    analysis.preprocessing = {
+      enabled: config.preprocessingEnabled,
+      stepsApplied: preprocessingSteps,
+      processed: processedText,
+      originalLength: message.length,
+      processedLength: processedText.length,
+    };
 
-function formatMemoriesForPrompt(memories: Memory[]): string {
-  if (memories.length === 0) return "";
-  
-  const memoryText = memories.map((m) => 
-    `[${m.type.toUpperCase()}] ${m.content}`
-  ).join("\n");
-  
-  return `\n\n## Relevant Memories About This User:\n${memoryText}\n`;
-}
+    // Language detection
+    if (config.languageDetectionEnabled) {
+      const detected = detectLanguage(processedText);
+      const isSupported = config.detectedLanguages.includes(detected.code);
 
-// ============================================
-// AUTO-MEMORY EXTRACTION
-// ============================================
-
-interface ExtractedFact {
-  content: string;
-  type: "fact" | "opinion" | "belief" | "episodic";
-  confidence: number;
-}
-
-function extractFactsFromMessage(userMessage: string): ExtractedFact[] {
-  const facts: ExtractedFact[] = [];
-  const lowerMsg = userMessage.toLowerCase();
-  
-  // Identity - Name patterns
-  const namePatterns = [
-    /my name is (\w+)/i,
-    /call me (\w+(?:\s+\w+)?)/i,
-  ];
-  
-  for (const pattern of namePatterns) {
-    const match = userMessage.match(pattern);
-    if (match && match[1]) {
-      const notNames = ["a", "the", "not", "very", "so", "here", "there"];
-      if (!notNames.includes(match[1].toLowerCase())) {
-        facts.push({
-          content: `User's name is ${match[1]}`,
-          type: "fact",
-          confidence: 0.95
-        });
-      }
-    }
-  }
-  
-  // Preferences
-  if (/i (?:really )?(?:love|like|enjoy|prefer) /i.test(lowerMsg)) {
-    facts.push({ content: userMessage.trim(), type: "opinion", confidence: 0.85 });
-  }
-  
-  // Explicit remember requests
-  const rememberMatch = userMessage.match(/remember (?:that|this)[:\s]+(.+?)(?:\.|$)/i);
-  if (rememberMatch && rememberMatch[1]) {
-    facts.push({ content: rememberMatch[1].trim(), type: "fact", confidence: 1.0 });
-  }
-  
-  // Location/work
-  if (/i (?:live|work|am from|moved to) /i.test(lowerMsg)) {
-    facts.push({ content: userMessage.trim(), type: "fact", confidence: 0.85 });
-  }
-  
-  // Family
-  if (/my (?:wife|husband|spouse|partner|son|daughter|child|mom|dad|mother|father|brother|sister)/i.test(lowerMsg)) {
-    facts.push({ content: userMessage.trim(), type: "fact", confidence: 0.9 });
-  }
-  
-  return facts;
-}
-
-async function autoSaveMemories(
-  userId: string, 
-  userMessage: string,
-  geminiKey: string,
-  infraConfig: InfrastructureConfig
-): Promise<number> {
-  const facts = extractFactsFromMessage(userMessage);
-  console.log("Auto-save: checking message:", userMessage.substring(0, 50));
-  console.log("Auto-save: extracted facts:", JSON.stringify(facts));
-  let savedCount = 0;
-  
-  for (const fact of facts) {
-    if (fact.confidence >= 0.8) {
-      try {
-        await saveMemoryToFirestore({
-          userId,
-          content: fact.content,
-          type: fact.type,
-          importance: fact.confidence,
-          context: "personal",
-        }, geminiKey, infraConfig);
-        savedCount++;
-        console.log(`Auto-saved memory: ${fact.content.substring(0, 50)}`);
-      } catch (error) {
-        console.error("Auto-save failed:", error);
-      }
-    }
-  }
-  return savedCount;
-}
-
-// ============================================
-// LLM CALL FUNCTIONS
-// ============================================
-
-interface LLMResult {
-  content: string;
-  tokensIn: number;
-  tokensOut: number;
-}
-
-async function callClaude(apiKey: string, model: string, message: string, systemPrompt: string, maxTokens: number): Promise<LLMResult> {
-  const client = new Anthropic({apiKey});
-  const response = await client.messages.create({
-    model,
-    max_tokens: maxTokens,
-    system: systemPrompt,
-    messages: [{role: "user", content: message}],
-  });
-  
-  return {
-    content: response.content[0].type === "text" ? response.content[0].text : "",
-    tokensIn: response.usage?.input_tokens || 0,
-    tokensOut: response.usage?.output_tokens || 0,
-  };
-}
-
-async function callOpenAI(apiKey: string, model: string, message: string, systemPrompt: string, maxTokens: number): Promise<LLMResult> {
-  const client = new OpenAI({apiKey});
-  const response = await client.chat.completions.create({
-    model,
-    max_tokens: maxTokens,
-    messages: [
-      {role: "system", content: systemPrompt},
-      {role: "user", content: message},
-    ],
-  });
-  
-  return {
-    content: response.choices[0]?.message?.content || "",
-    tokensIn: response.usage?.prompt_tokens || 0,
-    tokensOut: response.usage?.completion_tokens || 0,
-  };
-}
-
-async function callGemini(apiKey: string, model: string, message: string, systemPrompt: string, _maxTokens?: number): Promise<LLMResult> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      system_instruction: {parts: [{text: systemPrompt}]},
-      contents: [{parts: [{text: message}]}],
-    }),
-  });
-  
-  const data: {
-    error?: { message?: string };
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-    usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
-  } = await response.json();
-  if (data.error) {
-    throw new Error(data.error.message || "Gemini API error");
-  }
-  
-  return {
-    content: data.candidates?.[0]?.content?.parts?.[0]?.text || "",
-    tokensIn: data.usageMetadata?.promptTokenCount || 0,
-    tokensOut: data.usageMetadata?.candidatesTokenCount || 0,
-  };
-}
-
-// LLM Router with fallback chain
-type LLMCaller = (apiKey: string, model: string, message: string, systemPrompt: string, maxTokens: number) => Promise<LLMResult>;
-
-const LLM_CALLERS: Record<string, { call: LLMCaller; keyName: keyof ApiKeys }> = {
-  claude: { call: callClaude, keyName: "claude" },
-  openai: { call: callOpenAI, keyName: "openai" },
-  gemini: { 
-    call: (apiKey: string, model: string, message: string, systemPrompt: string, maxTokens: number) => callGemini(apiKey, model, message, systemPrompt, maxTokens),
-    keyName: "gemini" 
-  },
-};
-
-async function routeToLLM(
-  message: string,
-  category: Category | null,
-  apiKeys: ApiKeys,
-  systemPrompt: string,
-  llmConfig: LLMConfig,
-  requestedProvider?: string
-): Promise<{ content: string; tokensIn: number; tokensOut: number; provider: string; model: string; usedFallback: boolean }> {
-  const errors: string[] = [];
-  const maxTokens = llmConfig.claude?.max_tokens || 1024;
-
-  // Determine routing order
-  let orderedProviders: string[];
-  
-  if (requestedProvider && requestedProvider !== "all") {
-    // Direct provider request
-    orderedProviders = [normalizeLLMName(requestedProvider)];
-  } else if (category) {
-    // Smart router - use category's primaryLLM and fallbackLLM
-    const primary = normalizeLLMName(category.primaryLLM);
-    const fallback = normalizeLLMName(category.fallbackLLM);
-    
-    orderedProviders = [primary];
-    if (fallback && fallback !== primary) orderedProviders.push(fallback);
-    
-    // Add remaining providers as last resort
-    const allProviders = ["claude", "openai", "gemini"];
-    for (const p of allProviders) {
-      if (!orderedProviders.includes(p)) orderedProviders.push(p);
-    }
-  } else {
-    // No category, use default
-    const defaultProvider = llmConfig.default_provider || "claude";
-    orderedProviders = [normalizeLLMName(defaultProvider), "claude", "openai", "gemini"];
-    // Remove duplicates
-    orderedProviders = [...new Set(orderedProviders)];
-  }
-
-  console.log("Routing order:", orderedProviders.join(" -> "));
-
-  let attemptIndex = 0;
-
-  for (const providerName of orderedProviders) {
-    const caller = LLM_CALLERS[providerName];
-    if (!caller) {
-      errors.push(`${providerName}: unknown provider`);
-      continue;
-    }
-    
-    const apiKey = apiKeys[caller.keyName];
-    if (!apiKey) {
-      errors.push(`${providerName}: no API key`);
-      continue;
-    }
-    
-    // Get the correct model for THIS provider
-    let model: string;
-    
-    // Check if we're using category's primary or fallback
-    if (attemptIndex === 0 && category?.primaryLLM && normalizeLLMName(category.primaryLLM) === providerName) {
-      // Primary provider matches - use category's primary model
-      model = getModelFromLLMName(category.primaryLLM, llmConfig);
-    } else if (attemptIndex === 1 && category?.fallbackLLM && normalizeLLMName(category.fallbackLLM) === providerName) {
-      // Fallback provider matches - use category's fallback model  
-      model = getModelFromLLMName(category.fallbackLLM, llmConfig);
-    } else {
-      // Use provider's default model from config
-      if (providerName === "claude") {
-        model = llmConfig.claude?.model || "claude-3-haiku-20240307";
-      } else if (providerName === "openai") {
-        model = llmConfig.openai?.model || "gpt-4o-mini";
-      } else if (providerName === "gemini") {
-        model = llmConfig.gemini?.model || "gemini-2.0-flash-exp";
-      } else {
-        model = "claude-3-haiku-20240307";
-      }
-    }
-    
-    try {
-      console.log(`Trying ${providerName} with model ${model}...`);
-      const result = await caller.call(apiKey, model, message, systemPrompt, maxTokens);
-      console.log(`${providerName} succeeded - Tokens: in=${result.tokensIn}, out=${result.tokensOut}`);
-      
-      return {
-        ...result,
-        provider: providerName,
-        model,
-        usedFallback: attemptIndex > 0
+      analysis.language = {
+        detected: detected.code,
+        confidence: detected.confidence,
+        supported: isSupported,
+        supportedLanguages: config.detectedLanguages,
       };
-    } catch (error: unknown) {
-      const errMsg = error instanceof Error ? error.message : "Unknown error";
-      console.error(`${providerName} failed:`, errMsg);
-      errors.push(`${providerName}: ${errMsg}`);
-      attemptIndex++;
+    } else {
+      analysis.language = {
+        detectionEnabled: false,
+      };
     }
-  }
 
-  throw new Error(`All LLMs failed: ${errors.join("; ")}`);
+    // Overall validation
+    const validationErrors: string[] = [];
+
+    if (tokenLimitExceeded) {
+      validationErrors.push(`Token limit exceeded: ${estimatedTokens} > ${config.maxTokens}`);
+    }
+
+    // Check processed text for empty content (after quote stripping and whitespace handling)
+    if (processedText === '' || processedText === '""' || processedText === "''") {
+      validationErrors.push('Empty input after preprocessing');
+    }
+
+    analysis.validation = {
+      passed: validationErrors.length === 0,
+      errors: validationErrors,
+    };
+
+    // Timing
+    const latencyMs = Date.now() - startTime;
+    analysis.latencyMs = latencyMs;
+    analysis.timestamp = new Date().toISOString();
+
+    console.log(`[INPUT-ANALYSIS] Completed in ${latencyMs}ms`);
+    res.json(analysis);
+
+  } catch (error) {
+    console.error('[INPUT-ANALYSIS] Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * Classifier Config interface - reads from config/pipeline/stages/classifier
+ */
+interface ClassifierConfig {
+  keywords: {
+    code: string[];
+    creative: string[];
+    factual: string[];
+    reasoning: string[];
+    casual: string[];
+  };
+  scoring: {
+    baseScorePerKeyword: number;
+    multipleKeywordMultiplier: number;
+    scoreCap: number;
+    confidenceThreshold: number;
+    wordBoundaryMatching: boolean;
+    defaultCasualScore: number;
+  };
+  priority: string[];
+  fallbackIntent: string;
+  // For backwards compatibility with existing code
+  minConfidenceThreshold: number;
 }
 
-// ============================================
-// MAIN CHAT ENDPOINT
-// ============================================
+/**
+ * Get Classifier config from config/pipeline/stages/classifier
+ * Falls back to config/brain.classifier for backwards compatibility
+ */
+async function getClassifierConfig(): Promise<ClassifierConfig> {
+  // Default values
+  const defaults: ClassifierConfig = {
+    keywords: {
+      code: ['python', 'javascript', 'flutter', 'dart', 'code', 'script', 'debug', 'fix', 'error', 'bug', 'api', 'function', 'class', 'method', 'variable', 'sort', 'loop', 'array', 'list', 'database'],
+      creative: ['poem', 'story', 'song', 'lyrics', 'compose', 'invent', 'imagine', 'design', 'create', 'artistic'],
+      factual: ['what is', 'who is', 'when did', 'where is', 'how many', 'how much', 'define', 'meaning', 'capital of', 'tell me about'],
+      reasoning: ['why', 'explain', 'analyze', 'think', 'compare', 'evaluate', 'reason', 'because'],
+      casual: ['hello', 'hi', 'hey', 'thanks', 'ok', 'sure', 'bye'],
+    },
+    scoring: {
+      baseScorePerKeyword: 0.25,
+      multipleKeywordMultiplier: 1.5,
+      scoreCap: 0.95,
+      confidenceThreshold: 0.60,
+      wordBoundaryMatching: true,
+      defaultCasualScore: 0.50,
+    },
+    priority: ['code', 'reasoning', 'creative', 'factual', 'casual'],
+    fallbackIntent: 'casual',
+    minConfidenceThreshold: 0.60,
+  };
 
-export const chat = onRequest({memory: "512MiB", timeoutSeconds: 120}, (req: Request, res: Response) => {
-  corsHandler(req, res, async () => {
-    if (req.method !== "POST") {
-      res.status(405).json({error: "Method not allowed"});
-      return;
+  try {
+    // Try new path first: config/pipeline/stages/classifier
+    const pipelineDoc = await db.doc('config/pipeline/stages/classifier').get();
+
+    if (pipelineDoc.exists) {
+      const data = pipelineDoc.data() || {};
+      const keywords = data.keywords || {};
+      const scoring = data.scoring || {};
+
+      console.log('[CLASSIFIER] Config loaded from config/pipeline/stages/classifier');
+      return {
+        keywords: {
+          code: keywords.code ?? defaults.keywords.code,
+          creative: keywords.creative ?? defaults.keywords.creative,
+          factual: keywords.factual ?? defaults.keywords.factual,
+          reasoning: keywords.reasoning ?? defaults.keywords.reasoning,
+          casual: keywords.casual ?? defaults.keywords.casual,
+        },
+        scoring: {
+          baseScorePerKeyword: scoring.baseScorePerKeyword ?? defaults.scoring.baseScorePerKeyword,
+          multipleKeywordMultiplier: scoring.multipleKeywordMultiplier ?? defaults.scoring.multipleKeywordMultiplier,
+          scoreCap: scoring.scoreCap ?? defaults.scoring.scoreCap,
+          confidenceThreshold: scoring.confidenceThreshold ?? defaults.scoring.confidenceThreshold,
+          wordBoundaryMatching: scoring.wordBoundaryMatching ?? defaults.scoring.wordBoundaryMatching,
+          defaultCasualScore: scoring.defaultCasualScore ?? defaults.scoring.defaultCasualScore,
+        },
+        priority: data.priority ?? defaults.priority,
+        fallbackIntent: data.fallbackIntent ?? defaults.fallbackIntent,
+        minConfidenceThreshold: scoring.confidenceThreshold ?? defaults.scoring.confidenceThreshold,
+      };
     }
 
-    const startTime = Date.now();
+    // No classifier config found - use defaults
+    console.log('[CLASSIFIER] No config found, using defaults');
+    return defaults;
+  } catch (error) {
+    console.error('[CLASSIFIER] Error loading config:', error);
+    return defaults;
+  }
+}
 
-    try {
-      const {message, iin, userId: requestedUserId, userName, context, provider: requestedProvider} = req.body as ChatRequest;
+/**
+ * Calculate intent scores based on keyword matching
+ * Uses config-driven keywords and scoring formula:
+ * - 1 keyword:  baseScore × 1 = baseScore
+ * - 2+ keywords: baseScore × count × multiplier (capped at scoreCap)
+ *
+ * Word boundary matching (when enabled) prevents partial matches:
+ * - "hi" won't match "physics" or "thinking"
+ * - Uses regex \b word boundaries
+ */
+function calculateIntentScores(
+  text: string,
+  config: ClassifierConfig
+): { scores: Record<string, number>; matchedKeywords: string[]; method: string } {
+  const lowerText = text.toLowerCase();
+  const matchedKeywords: string[] = [];
+  const scores: Record<string, number> = {
+    code: 0,
+    creative: 0,
+    factual: 0,
+    reasoning: 0,
+    casual: 0,
+  };
 
-      if (!message) {
-        res.status(400).json({error: "message is required"});
-        return;
-      }
+  const { baseScorePerKeyword, multipleKeywordMultiplier, scoreCap, wordBoundaryMatching, defaultCasualScore } = config.scoring;
 
-      // Resolve IIN to userId if provided
-      let userId = requestedUserId;
-      if (iin && !userId) {
-        const resolvedUid = await resolveIINtoUID(iin);
-        if (!resolvedUid) {
-          res.status(404).json({error: "User not found for IIN", iin});
-          return;
-        }
-        userId = resolvedUid;
-      }
-
-      console.log("\n=== CHAT REQUEST ===");
-      console.log(`Message: "${message}"`);
-      console.log(`IIN: ${iin || "not provided"}`);
-      console.log(`UserId: ${userId}`);
-      console.log(`Requested provider: ${requestedProvider || "all"}`);
-
-      // Load all configs in parallel
-      const [apiKeys, llmConfig, categories, settings, infraConfig] = await Promise.all([
-        getApiKeys(),
-        getLLMConfig(),
-        getCategories(),
-        getGlobalSettings(),
-        getInfrastructureConfig(),
-      ]);
-
-      console.log("Keys available:", {
-        claude: !!apiKeys.claude,
-        openai: !!apiKeys.openai,
-        gemini: !!apiKeys.gemini,
-      });
-      console.log("Default provider:", llmConfig.default_provider);
-      console.log("Vertex AI enabled:", infraConfig.vertexai?.enabled || false);
-
-      // Check guardrails
-      const guardrailCheck = checkGuardrails(message, settings);
-      if (guardrailCheck.blocked) {
-        res.json({
-          response: "I cannot help with that topic. It falls outside my guidelines.",
-          provider: "system",
-          model: "guardrail",
-          userName: null,
-          latency: Date.now() - startTime,
-          tokens: { input: 0, output: 0, total: 0 },
-          debug: {
-            routingMethod: "blocked",
-            matchedCategory: null,
-            categoryId: null,
-            primaryLLM: null,
-            fallbackLLM: null,
-            usedFallback: false,
-            restricted: guardrailCheck.domain,
-            defaultProvider: llmConfig.default_provider || null,
-            memoriesUsed: 0,
-            memoriesSaved: 0,
-          },
-        } as ChatResponse);
-        return;
-      }
-
-      // Match category (Smart Router)
-      const category = matchCategory(message, categories);
-      console.log("Category:", category?.id, "Primary:", category?.primaryLLM, "Fallback:", category?.fallbackLLM);
-
-      // Get user name
-      let userFirstName = userName;
-      if (!userFirstName && userId) {
-        const profile = await getUserProfile(userId);
-        userFirstName = profile?.firstName || profile?.displayName?.split(" ")[0];
-      }
-
-      // Fetch relevant memories
-      let memories: Memory[] = [];
-      let memoriesText = "";
-      
-      console.log("Memory fetch check:", { userId, hasGeminiKey: !!apiKeys.gemini });
-      
-      if (userId && apiKeys.gemini) {
-        try {
-          memories = await searchMemories(message, userId, apiKeys.gemini, infraConfig, 5);
-          memoriesText = formatMemoriesForPrompt(memories);
-          console.log(`Found ${memories.length} relevant memories:`, memories.map(m => m.content?.substring(0, 30)));
-        } catch (error) {
-          console.error("Memory search error:", error);
-        }
-      } else {
-        console.log("Skipping memory fetch - missing userId or gemini key");
-      }
-
-      // Build system prompt
-      const responseSettings = settings.response || {};
-      const style = responseSettings.default_style || "friendly";
-      let systemPrompt = "You are IAMONEAI, a personal AI guardian.";
-      
-      if (style === "direct") {
-        systemPrompt += " Be concise and direct. Give facts without unnecessary elaboration.";
-      } else if (style === "friendly") {
-        systemPrompt += " Be helpful, friendly, and concise.";
-      } else if (style === "conversational") {
-        systemPrompt += " Be warm, engaging, and conversational. Show personality.";
-      }
-      
-      systemPrompt += `\n\nContext: ${context || "personal"}`;
-      if (userId) systemPrompt += `\nUser ID: ${userId}`;
-      if (userFirstName) {
-        systemPrompt += `\nUser's name: ${userFirstName}. Use their name naturally when appropriate.`;
-      }
-      
-      // Add memories to prompt
-      systemPrompt += memoriesText;
-      
-      // Add guardrail disclaimer if restricted
-      if (guardrailCheck.restricted && guardrailCheck.disclaimer) {
-        systemPrompt += `\n\nIMPORTANT: ${guardrailCheck.disclaimer}`;
-      }
-
-      // Route to LLM
-      const llmResult = await routeToLLM(
-        message,
-        category,
-        apiKeys,
-        systemPrompt,
-        llmConfig,
-        requestedProvider
-      );
-
-      // Auto-save memories from conversation
-      let memoriesSaved = 0;
-      if (userId && apiKeys.gemini) {
-        try {
-          memoriesSaved = await autoSaveMemories(userId, message, apiKeys.gemini, infraConfig);
-        } catch (e) {
-          console.error("Auto-save error:", e);
-        }
-      }
-
-      // Determine routing method
-      let routingMethod = "smart_router";
-      if (requestedProvider && requestedProvider !== "all") {
-        routingMethod = "direct";
-      } else if (!category) {
-        routingMethod = "default";
-      }
-
-      res.json({
-        response: llmResult.content,
-        provider: llmResult.provider,
-        model: llmResult.model,
-        userName: userFirstName || null,
-        latency: Date.now() - startTime,
-        tokens: {
-          input: llmResult.tokensIn,
-          output: llmResult.tokensOut,
-          total: llmResult.tokensIn + llmResult.tokensOut,
-        },
-        debug: {
-          routingMethod,
-          matchedCategory: category?.displayName || category?.name || null,
-          categoryId: category?.id || null,
-          primaryLLM: category?.primaryLLM || null,
-          fallbackLLM: category?.fallbackLLM || null,
-          usedFallback: llmResult.usedFallback,
-          restricted: guardrailCheck.restricted ? guardrailCheck.domain : null,
-          defaultProvider: llmConfig.default_provider || null,
-          memoriesUsed: memories.length,
-          memoryDetails: memories,
-          memoriesSaved: memoriesSaved,
-        },
-      } as ChatResponse);
-
-    } catch (error: unknown) {
-      const errMsg = error instanceof Error ? error.message : "Unknown error";
-      console.error("Chat error:", errMsg);
-      res.status(500).json({
-        error: errMsg || "Internal server error",
-        latency: Date.now() - startTime,
-        debug: {
-          routingMethod: "error",
-          matchedCategory: null,
-          categoryId: null,
-          primaryLLM: null,
-          fallbackLLM: null,
-          usedFallback: false,
-          restricted: null,
-          defaultProvider: null,
-          memoriesUsed: 0,
-          memoriesSaved: 0,
-        },
-      });
-    }
-  });
-});
-
-// ============================================
-// MEMORY ENDPOINT
-// ============================================
-
-export const memory = onRequest({memory: "512MiB", timeoutSeconds: 120}, (req: Request, res: Response) => {
-  corsHandler(req, res, async () => {
-    if (req.method === "POST") {
-      // Save new memory
-      try {
-        const {iin, userId: requestedUserId, content, type, context, importance} = req.body as MemoryRequest;
-
-        // Resolve IIN to userId if provided
-        let userId = requestedUserId;
-        if (iin && !userId) {
-          const resolvedUid = await resolveIINtoUID(iin);
-          if (!resolvedUid) {
-            res.status(404).json({error: "User not found for IIN", iin});
-            return;
-          }
-          userId = resolvedUid;
-        }
-
-        if (!userId || !content) {
-          res.status(400).json({error: "iin/userId and content are required"});
-          return;
-        }
-
-        const [apiKeys, infraConfig] = await Promise.all([
-          getApiKeys(),
-          getInfrastructureConfig(),
-        ]);
-
-        if (!apiKeys.gemini) {
-          res.status(500).json({error: "Gemini API key required for embeddings"});
-          return;
-        }
-
-        const memoryId = await saveMemoryToFirestore({
-          userId,
-          content,
-          type: type || "fact",
-          context: context || "personal",
-          importance: importance || 0.5,
-        }, apiKeys.gemini, infraConfig);
-
-        res.json({
-          success: true,
-          memoryId,
-          message: "Memory saved",
-        });
-      } catch (error: unknown) {
-        const errMsg = error instanceof Error ? error.message : "Unknown error";
-        console.error("Memory save error:", errMsg);
-        res.status(500).json({error: errMsg});
-      }
-    } else if (req.method === "GET") {
-      // Search/list memories
-      try {
-        // Accept either iin or userId (iin preferred)
-        let userId = req.query.userId as string;
-        const iin = req.query.iin as string;
-        const query = req.query.query as string;
-        const limit = parseInt(req.query.limit as string) || 10;
-
-        // If IIN provided, look up the UID
-        if (iin && !userId) {
-          const snapshot = await db.collection("users").where("iin", "==", iin).limit(1).get();
-          if (snapshot.empty) {
-            res.status(404).json({error: "User not found for IIN"});
-            return;
-          }
-          userId = snapshot.docs[0].id;
-        }
-
-        if (!userId) {
-          res.status(400).json({error: "iin or userId is required"});
-          return;
-        }
-
-        const [apiKeys, infraConfig] = await Promise.all([
-          getApiKeys(),
-          getInfrastructureConfig(),
-        ]);
-        
-        if (query && apiKeys.gemini) {
-          const memories = await searchMemories(query, userId, apiKeys.gemini, infraConfig, limit);
-          res.json({memories, count: memories.length, searchType: "semantic"});
-        } else {
-          const memories = await getRecentMemories(userId, limit);
-          res.json({memories, count: memories.length, searchType: "recent"});
-        }
-      } catch (error: unknown) {
-        const errMsg = error instanceof Error ? error.message : "Unknown error";
-        console.error("Memory fetch error:", errMsg);
-        res.status(500).json({error: errMsg});
-      }
+  // Helper function to check if keyword matches
+  const keywordMatches = (keyword: string, text: string): boolean => {
+    const lowerKeyword = keyword.toLowerCase();
+    if (wordBoundaryMatching) {
+      // Use word boundary matching to prevent partial matches
+      // e.g., "hi" won't match "physics" or "thinking"
+      const regex = new RegExp(`\\b${lowerKeyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      return regex.test(text);
     } else {
-      res.status(405).json({error: "Method not allowed"});
+      // Simple substring matching (original behavior)
+      return text.includes(lowerKeyword);
+    }
+  };
+
+  // Helper function to calculate score from matches
+  const calculateScore = (matches: string[]): number => {
+    if (matches.length === 0) return 0;
+    if (matches.length === 1) return baseScorePerKeyword;
+    // Multiple keywords: baseScore × count × multiplier, capped
+    return Math.min(scoreCap, baseScorePerKeyword * matches.length * multipleKeywordMultiplier);
+  };
+
+  // Check each intent's keywords from config
+  const intentKeywords: Record<string, string[]> = {
+    code: config.keywords.code,
+    creative: config.keywords.creative,
+    factual: config.keywords.factual,
+    reasoning: config.keywords.reasoning,
+    casual: config.keywords.casual,
+  };
+
+  Object.entries(intentKeywords).forEach(([intent, keywords]) => {
+    const matches = keywords.filter(kw => keywordMatches(kw, lowerText));
+    if (matches.length > 0) {
+      matchedKeywords.push(...matches.map(m => `${intent}:${m}`));
+      scores[intent] = calculateScore(matches);
     }
   });
-});
 
-// ============================================
-// HEALTH CHECK ENDPOINT
-// ============================================
+  // If no keywords matched, use defaultCasualScore
+  const maxScore = Math.max(...Object.values(scores));
+  if (maxScore === 0) {
+    scores.casual = defaultCasualScore;
+  }
 
-export const health = onRequest({memory: "256MiB"}, (req: Request, res: Response) => {
-  corsHandler(req, res, () => {
-    res.json({
-      status: "ok",
-      timestamp: new Date().toISOString(),
-      version: "2.1.0-smartrouter",
+  return {
+    scores,
+    matchedKeywords,
+    method: wordBoundaryMatching ? 'keyword-boundary' : 'keyword-substring',
+  };
+}
+
+/**
+ * Test Classifier endpoint
+ * Tests Stage 2 of the Inference Pipeline
+ */
+export const testClassifier = onRequest(async (req: Request, res: Response) => {
+  // CORS
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.status(204).send('');
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+
+  const { message } = req.body;
+  const startTime = Date.now();
+
+  if (!message || typeof message !== 'string') {
+    res.status(400).json({ error: 'Message is required' });
+    return;
+  }
+
+  try {
+    // Load configurations
+    const classifierConfig = await getClassifierConfig();
+    const brainConfig = await getBrainConfig();
+    console.log('[CLASSIFIER] Config loaded from config/brain.routing');
+
+    // Preprocess text (simple for now)
+    const preprocessed = message.trim().replace(/\s+/g, ' ');
+
+    // Calculate intent scores
+    const { scores, matchedKeywords, method } = calculateIntentScores(preprocessed, classifierConfig);
+
+    // Find highest scoring intent
+    let detectedIntent = classifierConfig.fallbackIntent;
+    let maxConfidence = 0;
+
+    Object.entries(scores).forEach(([intent, score]) => {
+      if (score > maxConfidence) {
+        maxConfidence = score;
+        detectedIntent = intent;
+      }
     });
-  });
+
+    // Check if confidence meets threshold
+    const fallbackUsed = maxConfidence < classifierConfig.minConfidenceThreshold;
+    if (fallbackUsed) {
+      detectedIntent = classifierConfig.fallbackIntent;
+    }
+
+    // Build response
+    const processingTime = Date.now() - startTime;
+
+    const result = {
+      stage: 'Classifier',
+      stageNumber: 2,
+      input: {
+        text: message,
+        preprocessed: preprocessed,
+        language: 'en',
+      },
+      classification: {
+        detectedIntent,
+        confidence: maxConfidence,
+        allScores: scores,
+        method,
+        matchedKeywords,
+        fallbackUsed,
+        threshold: classifierConfig.minConfidenceThreshold,
+      },
+      routing: {
+        selectedLLM: brainConfig.defaultLLM,
+        reason: 'Uses defaultLLM from config/brain',
+      },
+      config: {
+        classifierSource: 'config/pipeline/stages/classifier',
+        brainSource: 'config/brain',
+        defaultLLM: brainConfig.defaultLLM,
+        scoring: classifierConfig.scoring,
+        priority: classifierConfig.priority,
+        fallbackIntent: classifierConfig.fallbackIntent,
+        keywordCounts: {
+          code: classifierConfig.keywords.code.length,
+          creative: classifierConfig.keywords.creative.length,
+          factual: classifierConfig.keywords.factual.length,
+          reasoning: classifierConfig.keywords.reasoning.length,
+          casual: classifierConfig.keywords.casual.length,
+        },
+      },
+      processingTime: `${processingTime}ms`,
+      timestamp: new Date().toISOString(),
+    };
+
+    console.log(`[CLASSIFIER] intent=${detectedIntent} confidence=${maxConfidence.toFixed(2)} time=${processingTime}ms`);
+    res.json(result);
+
+  } catch (error) {
+    console.error('[CLASSIFIER] Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// ============================================
-// USER REGISTRATION ENDPOINT
-// ============================================
+// ═══════════════════════════════════════════════════════════
+// STAGE 3: CONFIDENCE GATE
+// ═══════════════════════════════════════════════════════════
 
-export const registerUser = onRequest({memory: "256MiB"}, (req: Request, res: Response) => {
-  corsHandler(req, res, async () => {
-    if (req.method !== "POST") {
-      res.status(405).json({error: "Method not allowed"});
+export { testConfidenceGate } from './stages/confidenceGate';
+
+// ═══════════════════════════════════════════════════════════
+// STAGE 4: INTENT RESOLUTION
+// ═══════════════════════════════════════════════════════════
+
+export { testIntentResolution } from './stages/intentResolution';
+
+// ═══════════════════════════════════════════════════════════
+// STAGE 5: MEMORY QUERY
+// ═══════════════════════════════════════════════════════════
+
+export { testMemoryQuery } from './stages/memoryQuery';
+
+// ═══════════════════════════════════════════════════════════
+// STAGE 6: MEMORY EXTRACTION
+// ═══════════════════════════════════════════════════════════
+
+export { testMemoryExtraction } from './stages/memoryExtraction';
+
+// ═══════════════════════════════════════════════════════════
+// STAGE 7: CURIOSITY MODULE
+// ═══════════════════════════════════════════════════════════
+
+export { testCuriosityModule } from './stages/curiosityModule';
+
+// ═══════════════════════════════════════════════════════════
+// STAGE 8: TRUST EVALUATION
+// ═══════════════════════════════════════════════════════════
+
+export { testTrustEvaluation } from './stages/trustEvaluation';
+
+// ═══════════════════════════════════════════════════════════
+// STAGE 9: SAVE DECISION
+// ═══════════════════════════════════════════════════════════
+
+export { testSaveDecision } from './stages/saveDecision';
+
+// ═══════════════════════════════════════════════════════════
+// STAGE 10: CONTEXT INJECTION
+// ═══════════════════════════════════════════════════════════
+
+export { testContextInjection } from './stages/contextInjection';
+
+// ═══════════════════════════════════════════════════════════
+// STAGE 11: LLM RESPONSE
+// ═══════════════════════════════════════════════════════════
+
+export { testLLMResponse } from './stages/llmResponse';
+
+// ═══════════════════════════════════════════════════════════
+// STAGE 12: POST-RESPONSE LOG
+// ═══════════════════════════════════════════════════════════
+
+export { testPostResponseLog } from './stages/postResponseLog';
+
+// ═══════════════════════════════════════════════════════════
+// PIPELINE ORCHESTRATOR
+// ═══════════════════════════════════════════════════════════
+
+export { pipelineChat, pipelineChatDebug } from './pipeline/orchestrator';
+
+// ═══════════════════════════════════════════════════════════
+// NIGHTLY COMPRESSION & CLEANUP
+// ═══════════════════════════════════════════════════════════
+
+export {
+  nightlyCompression,
+  triggerCompression,
+  weeklyCleanup,
+  triggerCleanup,
+} from './stages/compression';
+
+// ═══════════════════════════════════════════════════════════
+// SAVE MEMORY CARD ENDPOINT
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Save a completed memory card from Generative UI
+ * POST body: { iin: string, card: MemoryCard }
+ */
+export const saveMemoryCard = onRequest(
+  { memory: '256MiB', timeoutSeconds: 30 },
+  async (req: Request, res: Response) => {
+    // CORS
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.status(405).json({ success: false, error: 'Method not allowed' });
+      return;
+    }
+
+    const { iin, card } = req.body;
+
+    // Validate input
+    if (!iin || typeof iin !== 'string') {
+      res.status(400).json({ success: false, error: 'IIN is required' });
+      return;
+    }
+
+    if (!card || typeof card !== 'object') {
+      res.status(400).json({ success: false, error: 'Card is required' });
+      return;
+    }
+
+    const { type, slots, title } = card;
+
+    if (!type || !slots) {
+      res.status(400).json({ success: false, error: 'Card type and slots are required' });
       return;
     }
 
     try {
-      const {uid, email, firstName, lastName} = req.body;
-      
-      if (!uid || !email || !firstName || !lastName) {
-        res.status(400).json({error: "Missing required fields: uid, email, firstName, lastName"});
-        return;
+      console.log(`[SAVE-CARD] Saving ${type} card for IIN: ${iin}`);
+      console.log(`[SAVE-CARD] Title: ${title || 'untitled'}`);
+
+      // Build memory document from card slots
+      const slotData: Record<string, unknown> = {};
+      for (const [slotId, slotValue] of Object.entries(slots)) {
+        const sv = slotValue as { value?: unknown; filled?: boolean };
+        if (sv.filled && sv.value !== undefined && sv.value !== null) {
+          slotData[slotId] = sv.value;
+        }
       }
 
-      // Generate IIN
-      const now = new Date();
-      const year = now.getFullYear().toString().slice(-2);
-      const month = (now.getMonth() + 1).toString().padStart(2, "0");
-      const randomHex = () => Math.random().toString(16).substring(2, 6).toUpperCase();
-      const iin = `20AA-${year}${month}-${randomHex()}-${randomHex()}`;
-
-      const userData = {
+      // Create memory document
+      const memoryDoc = {
         iin,
-        email,
-        firstName,
-        lastName,
-        displayName: `${firstName} ${lastName}`,
-        status: "ACTIVE",
-        role: "user",
+        type,
+        source: 'generative_ui',
+        title: title || `${type} memory`,
+        data: slotData,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        status: 'active',
+        confidence: 1.0, // User-confirmed data has high confidence
+        tempId: card.tempId || null,
       };
 
-      await db.collection("users").doc(uid).set(userData);
-      
-      res.json({success: true, iin, message: "User registered successfully"});
-    } catch (error: unknown) {
-      const errMsg = error instanceof Error ? error.message : "Unknown error";
-      console.error("Registration error:", errMsg);
-      res.status(500).json({error: "Failed to register user"});
+      // Save to Firestore (correct nested path: memories/{iin}/items/{memoryId})
+      const docRef = await db.collection('memories').doc(iin).collection('items').add(memoryDoc);
+
+      console.log(`[SAVE-CARD] ✅ Saved memory: ${docRef.id}`);
+
+      res.json({
+        success: true,
+        memoryId: docRef.id,
+        type,
+        timestamp: new Date().toISOString(),
+      });
+
+    } catch (error) {
+      console.error('[SAVE-CARD] Error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to save memory card',
+      });
     }
-  });
-});
+  }
+);
 
-// ============================================
-// GET USER BY IIN ENDPOINT
-// ============================================
+// ═══════════════════════════════════════════════════════════
+// UPDATE MEMORY ENDPOINT (Inline Edit)
+// ═══════════════════════════════════════════════════════════
 
-export const getUserByIIN = onRequest({memory: "256MiB"}, (req: Request, res: Response) => {
-  corsHandler(req, res, async () => {
-    if (req.method !== "GET") {
-      res.status(405).json({error: "Method not allowed"});
+/**
+ * Update an existing memory's slots (for inline edit)
+ * POST body: { iin: string, memoryId: string, updates: { slots?: Record<string, any>, ... } }
+ */
+export const updateMemory = onRequest(
+  { memory: '256MiB', timeoutSeconds: 30 },
+  async (req: Request, res: Response) => {
+    // CORS
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.status(405).json({ success: false, error: 'Method not allowed' });
+      return;
+    }
+
+    const { iin, memoryId, updates } = req.body;
+
+    // Validate input
+    if (!iin || typeof iin !== 'string') {
+      res.status(400).json({ success: false, error: 'IIN is required' });
+      return;
+    }
+
+    if (!memoryId || typeof memoryId !== 'string') {
+      res.status(400).json({ success: false, error: 'memoryId is required' });
+      return;
+    }
+
+    if (!updates || typeof updates !== 'object') {
+      res.status(400).json({ success: false, error: 'updates object is required' });
       return;
     }
 
     try {
-      const iin = req.query.iin as string;
-      if (!iin) {
-        res.status(400).json({error: "IIN is required"});
+      console.log(`[UPDATE-MEMORY] Updating ${memoryId} for IIN: ${iin}`);
+
+      const memoryRef = db.collection('memories').doc(iin).collection('items').doc(memoryId);
+
+      // Check if memory exists
+      const memoryDoc = await memoryRef.get();
+      if (!memoryDoc.exists) {
+        res.status(404).json({ success: false, error: 'Memory not found' });
         return;
       }
 
-      const snapshot = await db.collection("users").where("iin", "==", iin).limit(1).get();
-      if (snapshot.empty) {
-        res.status(404).json({error: "User not found"});
-        return;
+      // Build update object - only allow certain fields to be updated
+      const allowedFields = ['slots', 'content', 'title', 'data'];
+      const sanitizedUpdates: Record<string, unknown> = {};
+
+      for (const field of allowedFields) {
+        if (updates[field] !== undefined) {
+          sanitizedUpdates[field] = updates[field];
+        }
       }
 
-      const userData = snapshot.docs[0].data();
+      // Always update the timestamp
+      sanitizedUpdates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+
+      await memoryRef.update(sanitizedUpdates);
+
+      console.log(`[UPDATE-MEMORY] ✅ Updated memory: ${memoryId}`);
+
       res.json({
         success: true,
-        user: {
-          iin: userData.iin,
-          firstName: userData.firstName,
-          lastName: userData.lastName,
-          displayName: userData.displayName,
-          status: userData.status,
+        memoryId,
+        timestamp: new Date().toISOString(),
+      });
+
+    } catch (error) {
+      console.error('[UPDATE-MEMORY] Error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to update memory',
+      });
+    }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════
+// SAVE SELECTED MEMORIES ENDPOINT (Selection Grid)
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Save selected memories from a Selection Grid action
+ * POST body: { iin: string, actionId: string, selectedIds: string[], memories: SelectionItem[] }
+ */
+export const saveSelectedMemories = onRequest(
+  { memory: '256MiB', timeoutSeconds: 30 },
+  async (req: Request, res: Response) => {
+    // CORS
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.status(405).json({ success: false, error: 'Method not allowed' });
+      return;
+    }
+
+    const { iin, actionId, selectedIds, memories } = req.body;
+
+    // Validate input
+    if (!iin || typeof iin !== 'string') {
+      res.status(400).json({ success: false, error: 'IIN is required' });
+      return;
+    }
+
+    if (!selectedIds || !Array.isArray(selectedIds)) {
+      res.status(400).json({ success: false, error: 'selectedIds array is required' });
+      return;
+    }
+
+    if (!memories || !Array.isArray(memories)) {
+      res.status(400).json({ success: false, error: 'memories array is required' });
+      return;
+    }
+
+    try {
+      console.log(`[SAVE-SELECTED] Processing ${selectedIds.length} selected memories for IIN: ${iin}`);
+
+      const savedMemories: Array<{ id: string; type: string }> = [];
+      const batch = db.batch();
+
+      // Filter to only selected items
+      const selectedMemories = memories.filter((m: any) => selectedIds.includes(m.id));
+
+      for (const item of selectedMemories) {
+        const memoryData = item.memory || {};
+        const docRef = db.collection('memories').doc(iin).collection('items').doc();
+
+        batch.set(docRef, {
+          id: docRef.id,
+          iin,
+          type: memoryData.type || item.type || 'fact',
+          content: memoryData.content || item.label || '',
+          slots: memoryData.slots || {},
+          source: 'selection_grid',
+          status: 'active',
+          tier: 'working',
+          relevance: 0.9,
+          context: 'personal',
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          selectionGridActionId: actionId,
+        });
+
+        savedMemories.push({ id: docRef.id, type: memoryData.type || item.type });
+      }
+
+      await batch.commit();
+
+      console.log(`[SAVE-SELECTED] ✅ Saved ${savedMemories.length} memories`);
+
+      res.json({
+        success: true,
+        savedCount: savedMemories.length,
+        savedMemories,
+        skippedCount: memories.length - selectedMemories.length,
+        timestamp: new Date().toISOString(),
+      });
+
+    } catch (error) {
+      console.error('[SAVE-SELECTED] Error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to save selected memories',
+      });
+    }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════
+// RESOLVE CONFLICT ENDPOINT (Conflict Resolver)
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Resolve a memory conflict from a Conflict Resolver action
+ * POST body: { iin: string, actionId: string, choice: 'keep_old' | 'update', oldMemoryId: string, newValue?: any }
+ */
+export const resolveConflict = onRequest(
+  { memory: '256MiB', timeoutSeconds: 30 },
+  async (req: Request, res: Response) => {
+    // CORS
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.status(405).json({ success: false, error: 'Method not allowed' });
+      return;
+    }
+
+    const { iin, actionId, choice, oldMemoryId, newValue, field } = req.body;
+
+    // Validate input
+    if (!iin || typeof iin !== 'string') {
+      res.status(400).json({ success: false, error: 'IIN is required' });
+      return;
+    }
+
+    if (!choice || !['keep_old', 'update'].includes(choice)) {
+      res.status(400).json({ success: false, error: 'choice must be "keep_old" or "update"' });
+      return;
+    }
+
+    if (!oldMemoryId) {
+      res.status(400).json({ success: false, error: 'oldMemoryId is required' });
+      return;
+    }
+
+    try {
+      console.log(`[RESOLVE-CONFLICT] Processing conflict resolution for IIN: ${iin}, choice: ${choice}`);
+
+      const memoryRef = db.collection('memories').doc(iin).collection('items').doc(oldMemoryId);
+      const memoryDoc = await memoryRef.get();
+
+      if (!memoryDoc.exists) {
+        res.status(404).json({ success: false, error: 'Original memory not found' });
+        return;
+      }
+
+      let result: any = { choice };
+
+      if (choice === 'keep_old') {
+        // User chose to keep the old value - no changes needed
+        result.action = 'kept_existing';
+        result.message = 'Kept existing memory value';
+        console.log(`[RESOLVE-CONFLICT] ✅ Keeping old value`);
+      } else if (choice === 'update') {
+        // User chose to update - update the memory with new value
+        const updateData: Record<string, any> = {
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          conflictResolvedAt: admin.firestore.FieldValue.serverTimestamp(),
+          conflictActionId: actionId,
+        };
+
+        // Update the specific field if provided
+        if (field && newValue !== undefined) {
+          updateData[`data.${field}`] = newValue;
+          updateData.content = String(newValue);
+        } else if (newValue !== undefined) {
+          updateData.content = String(newValue);
+        }
+
+        await memoryRef.update(updateData);
+
+        result.action = 'updated';
+        result.message = 'Updated memory with new value';
+        result.memoryId = oldMemoryId;
+        console.log(`[RESOLVE-CONFLICT] ✅ Updated memory: ${oldMemoryId}`);
+      }
+
+      res.json({
+        success: true,
+        ...result,
+        timestamp: new Date().toISOString(),
+      });
+
+    } catch (error) {
+      console.error('[RESOLVE-CONFLICT] Error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to resolve conflict',
+      });
+    }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════
+// SAVE RELATIONSHIPS ENDPOINT (Relationship Graph)
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Save relationships from a Relationship Graph action
+ * POST body: { iin: string, actionId: string, connections: RelationshipConnection[] }
+ */
+export const saveRelationships = onRequest(
+  { memory: '256MiB', timeoutSeconds: 30 },
+  async (req: Request, res: Response) => {
+    // CORS
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.status(405).json({ success: false, error: 'Method not allowed' });
+      return;
+    }
+
+    const { iin, actionId, connections } = req.body;
+
+    // Validate input
+    if (!iin || typeof iin !== 'string') {
+      res.status(400).json({ success: false, error: 'IIN is required' });
+      return;
+    }
+
+    if (!connections || !Array.isArray(connections)) {
+      res.status(400).json({ success: false, error: 'connections array is required' });
+      return;
+    }
+
+    try {
+      console.log(`[SAVE-RELATIONSHIPS] Processing ${connections.length} connections for IIN: ${iin}`);
+
+      const savedRelationships: Array<{ id: string; to: string; relationship: string }> = [];
+      const batch = db.batch();
+
+      for (const conn of connections) {
+        const docRef = db.collection('memories').doc(iin).collection('items').doc();
+
+        // Build content string
+        const content = `User's ${conn.relationship}: ${conn.to}${conn.metadata?.location ? ` (lives in ${conn.metadata.location})` : ''}`;
+
+        batch.set(docRef, {
+          id: docRef.id,
+          iin,
+          type: 'relationship',
+          content,
+          slots: {
+            person_name: { value: conn.to, filled: true },
+            relationship_type: { value: conn.relationship, filled: true },
+            location: conn.metadata?.location ? { value: conn.metadata.location, filled: true } : { value: null, filled: false },
+          },
+          source: 'relationship_graph',
+          status: 'active',
+          tier: 'working',
+          relevance: 0.9,
+          context: 'personal',
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          relationshipGraphActionId: actionId,
+        });
+
+        savedRelationships.push({
+          id: docRef.id,
+          to: conn.to,
+          relationship: conn.relationship,
+        });
+      }
+
+      await batch.commit();
+
+      console.log(`[SAVE-RELATIONSHIPS] ✅ Saved ${savedRelationships.length} relationships`);
+
+      res.json({
+        success: true,
+        savedCount: savedRelationships.length,
+        savedRelationships,
+        timestamp: new Date().toISOString(),
+      });
+
+    } catch (error) {
+      console.error('[SAVE-RELATIONSHIPS] Error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to save relationships',
+      });
+    }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════
+// GET MEMORY DETAILS ENDPOINT (Timeline)
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Get memory details for timeline event
+ * POST body: { iin: string, memoryId: string }
+ */
+export const getMemoryDetails = onRequest(
+  { memory: '256MiB', timeoutSeconds: 30 },
+  async (req: Request, res: Response) => {
+    // CORS
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.status(405).json({ success: false, error: 'Method not allowed' });
+      return;
+    }
+
+    const { iin, memoryId } = req.body;
+
+    // Validate input
+    if (!iin || typeof iin !== 'string') {
+      res.status(400).json({ success: false, error: 'IIN is required' });
+      return;
+    }
+
+    if (!memoryId || typeof memoryId !== 'string') {
+      res.status(400).json({ success: false, error: 'memoryId is required' });
+      return;
+    }
+
+    try {
+      console.log(`[GET-MEMORY-DETAILS] Fetching memory ${memoryId} for IIN: ${iin}`);
+
+      const memoryRef = db.collection('memories').doc(iin).collection('items').doc(memoryId);
+      const memoryDoc = await memoryRef.get();
+
+      if (!memoryDoc.exists) {
+        res.status(404).json({ success: false, error: 'Memory not found' });
+        return;
+      }
+
+      const data = memoryDoc.data();
+      const createdAt = data?.createdAt?.toDate?.()?.toISOString() || null;
+      const updatedAt = data?.updatedAt?.toDate?.()?.toISOString() || null;
+
+      console.log(`[GET-MEMORY-DETAILS] ✅ Found memory: ${memoryId}`);
+
+      res.json({
+        success: true,
+        memory: {
+          id: memoryDoc.id,
+          type: data?.type || 'unknown',
+          content: data?.content || '',
+          slots: data?.slots || {},
+          tier: data?.tier || 'working',
+          status: data?.status || 'active',
+          context: data?.context || 'personal',
+          createdAt,
+          updatedAt,
         },
       });
-    } catch (error: unknown) {
-      const errMsg = error instanceof Error ? error.message : "Unknown error";
-      console.error("Get user error:", errMsg);
-      res.status(500).json({error: "Failed to get user"});
+
+    } catch (error) {
+      console.error('[GET-MEMORY-DETAILS] Error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to get memory details',
+      });
     }
-  });
-});
-// ============================================
-// USER AUTH EXPORTS
-// ============================================
-export { 
-  userAuthRegister, 
-  userAuthProfile, 
-  userAuthProfileByUid,
-  userAuthUpdateProfile 
-} from './user-auth';
+  }
+);
+
+// ═══════════════════════════════════════════════════════════
+// LOG ACTION INTERACTION ENDPOINT (Analytics)
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Log action interaction for analytics
+ * POST body: { iin: string, actionId: string, actionType: string, interaction: string, metadata?: object, timestamp?: string }
+ */
+export const logActionInteraction = onRequest(
+  { memory: '256MiB', timeoutSeconds: 30 },
+  async (req: Request, res: Response) => {
+    // CORS
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.status(405).json({ success: false, error: 'Method not allowed' });
+      return;
+    }
+
+    const { iin, actionId, actionType, interaction, metadata, timestamp } = req.body;
+
+    // Validate input
+    if (!iin || typeof iin !== 'string') {
+      res.status(400).json({ success: false, error: 'IIN is required' });
+      return;
+    }
+
+    if (!actionId || typeof actionId !== 'string') {
+      res.status(400).json({ success: false, error: 'actionId is required' });
+      return;
+    }
+
+    if (!actionType || typeof actionType !== 'string') {
+      res.status(400).json({ success: false, error: 'actionType is required' });
+      return;
+    }
+
+    if (!interaction || typeof interaction !== 'string') {
+      res.status(400).json({ success: false, error: 'interaction is required' });
+      return;
+    }
+
+    try {
+      console.log(`[LOG-INTERACTION] ${actionType} - ${interaction} for IIN: ${iin}`);
+
+      await db.collection('analytics').doc('generativeUI').collection('interactions').add({
+        iin,
+        actionId,
+        actionType,
+        interaction,
+        metadata: metadata || {},
+        timestamp: timestamp || new Date().toISOString(),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      console.log(`[LOG-INTERACTION] ✅ Logged interaction`);
+
+      res.json({
+        success: true,
+        timestamp: new Date().toISOString(),
+      });
+
+    } catch (error) {
+      // Silent fail for analytics - still return success to not block UI
+      console.error('[LOG-INTERACTION] Error (silent):', error);
+      res.json({
+        success: true,
+        note: 'Analytics logging failed silently',
+      });
+    }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════
+// GET GENERATIVE UI ANALYTICS ENDPOINT (Admin)
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Get Generative UI analytics for admin dashboard
+ * POST body: { startDate?: string, endDate?: string }
+ */
+export const getGenerativeUIAnalytics = onRequest(
+  { memory: '256MiB', timeoutSeconds: 60 },
+  async (req: Request, res: Response) => {
+    // CORS
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.status(405).json({ success: false, error: 'Method not allowed' });
+      return;
+    }
+
+    const { startDate, endDate } = req.body;
+
+    try {
+      console.log(`[ANALYTICS] Fetching Generative UI analytics`);
+
+      // Query interactions
+      let query = db.collection('analytics').doc('generativeUI').collection('interactions')
+        .orderBy('createdAt', 'desc')
+        .limit(10000);
+
+      const snapshot = await query.get();
+
+      // Aggregate by action type
+      const byActionType: Record<string, { total: number; completed: number; dismissed: number; errors: number }> = {};
+
+      for (const doc of snapshot.docs) {
+        const data = doc.data();
+
+        // Filter by date range if provided
+        if (startDate || endDate) {
+          const docTimestamp = data.timestamp;
+          if (startDate && docTimestamp < startDate) continue;
+          if (endDate && docTimestamp > endDate) continue;
+        }
+
+        const actionType = data.actionType || 'unknown';
+
+        if (!byActionType[actionType]) {
+          byActionType[actionType] = { total: 0, completed: 0, dismissed: 0, errors: 0 };
+        }
+
+        byActionType[actionType].total++;
+
+        switch (data.interaction) {
+          case 'completed':
+          case 'save':
+          case 'submit':
+          case 'confirm':
+          case 'update':
+          case 'keep_old':
+            byActionType[actionType].completed++;
+            break;
+          case 'dismissed':
+          case 'cancel':
+          case 'delete':
+            byActionType[actionType].dismissed++;
+            break;
+          case 'error':
+            byActionType[actionType].errors++;
+            break;
+        }
+      }
+
+      // Calculate completion rates
+      const analytics = Object.entries(byActionType).map(([type, stats]) => ({
+        actionType: type,
+        ...stats,
+        completionRate: stats.total > 0 ? Math.round((stats.completed / stats.total) * 100) : 0,
+      }));
+
+      console.log(`[ANALYTICS] ✅ Found ${snapshot.size} interactions`);
+
+      res.json({
+        success: true,
+        totalInteractions: snapshot.size,
+        byActionType: analytics,
+        dateRange: { startDate, endDate },
+      });
+
+    } catch (error) {
+      console.error('[ANALYTICS] Error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to get analytics',
+      });
+    }
+  }
+);

@@ -11,6 +11,7 @@ import { processIntentResolution } from '../stages/intentResolution';
 import { queryMemories } from '../stages/memoryQuery';
 import { extractMemories } from '../stages/memoryExtraction';
 import { checkConflicts } from '../stages/conflictCheck';
+import { processCalendar } from '../stages/calendar';
 import { processCuriosityModule } from '../stages/curiosityModule';
 import { processTrustEvaluation } from '../stages/trustEvaluation';
 import { makeSaveDecision } from '../stages/saveDecision';
@@ -66,6 +67,7 @@ interface OrchestratorConfig {
     memoryQuery: boolean;
     memoryExtraction: boolean;
     conflictCheck: boolean;      // Stage 6.5: Conflict Detection
+    calendar: boolean;           // Stage 6.7: Calendar/Events
     curiosityModule: boolean;
     trustEvaluation: boolean;
     saveDecision: boolean;
@@ -161,6 +163,7 @@ async function getOrchestratorConfig(): Promise<OrchestratorConfig> {
       memoryQuery: data.stages?.memoryQuery ?? true,
       memoryExtraction: data.stages?.memoryExtraction ?? true,
       conflictCheck: data.stages?.conflictCheck ?? true,
+      calendar: data.stages?.calendar ?? true,
       curiosityModule: data.stages?.curiosityModule ?? true,
       trustEvaluation: data.stages?.trustEvaluation ?? true,
       saveDecision: data.stages?.saveDecision ?? true,
@@ -895,6 +898,44 @@ export async function runPipeline(input: PipelineInput, forceDebug: boolean = fa
       }
     } else {
       stages.push({ stage: 'Conflict Check', stageNumber: 6.5, success: true, skipped: true, data: { reason: extractedMemories.length === 0 ? 'No memories to check' : 'Stage disabled' }, timeMs: 0 });
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // STAGE 6.7: CALENDAR/EVENTS
+    // Handles schedule_add, schedule_query, schedule_update, schedule_delete intents
+    // ═══════════════════════════════════════════════════════
+    let calendarResult: any = null;
+    const calendarIntents = ['schedule_add', 'schedule_query', 'schedule_update', 'schedule_delete'];
+    const isCalendarIntent = calendarIntents.includes(intentResult?.intent?.primary?.toLowerCase() ?? '');
+
+    if (config.stages.calendar && isCalendarIntent) {
+      const stage6_7 = await executeStageWithRetry(
+        'Calendar', 6.7,
+        () => processCalendar({
+          iin: input.iin,
+          message: input.message,
+          intent: intentResult?.intent?.primary?.toLowerCase() ?? 'unknown',
+          currentDate: new Date(),
+        }),
+        config
+      );
+      stages.push(stage6_7);
+      calendarResult = stage6_7.data;
+
+      if (stage6_7.success) {
+        console.log(`[ORCHESTRATOR] Calendar action: ${calendarResult?.action}, success: ${calendarResult?.success}`);
+
+        // If calendar handled the request and doesn't need clarification, we can use its response
+        if (calendarResult?.response && !calendarResult?.needsClarification) {
+          console.log(`[ORCHESTRATOR] Calendar provided response, may skip LLM`);
+        }
+      }
+
+      if (!stage6_7.success && config.execution.stopOnFirstError) {
+        throw new Error(`Stage 6.7 failed: ${stage6_7.error}`);
+      }
+    } else {
+      stages.push({ stage: 'Calendar', stageNumber: 6.7, success: true, skipped: true, data: { reason: !isCalendarIntent ? 'Not a calendar intent' : 'Stage disabled' }, timeMs: 0 });
     }
 
     // ═══════════════════════════════════════════════════════

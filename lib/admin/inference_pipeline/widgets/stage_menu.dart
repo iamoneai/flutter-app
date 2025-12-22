@@ -53,6 +53,7 @@ const List<PipelineStage> pipelineStages = [
   PipelineStage(number: 5, name: 'Memory Query', shortName: 'Memory Query', isImplemented: true),
   PipelineStage(number: 6, name: 'Memory Extraction', shortName: 'Memory Extraction', isImplemented: true),
   PipelineStage(number: 6.5, name: 'Conflict Check', shortName: 'Conflict Check', isImplemented: true),
+  PipelineStage(number: 6.7, name: 'Calendar/Events', shortName: 'Calendar', isImplemented: true),
   PipelineStage(number: 7, name: 'Curiosity Module', shortName: 'Curiosity Module', isImplemented: true),
   PipelineStage(number: 8, name: 'Trust Evaluation', shortName: 'Trust Evaluation', isImplemented: true),
   PipelineStage(number: 9, name: 'Save Decision', shortName: 'Save Decision', isImplemented: true),

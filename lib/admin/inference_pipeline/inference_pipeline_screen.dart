@@ -19,6 +19,7 @@ import 'stages/trust_evaluation_content.dart';
 import 'stages/post_response_log_content.dart';
 import 'stages/curiosity_module_content.dart';
 import 'stages/conflict_check_content.dart';
+import 'stages/calendar_content.dart';
 
 class InferencePipelineScreen extends StatefulWidget {
   const InferencePipelineScreen({super.key});
@@ -148,6 +149,7 @@ class _InferencePipelineScreenState extends State<InferencePipelineScreen> {
     if (stage.number == 5) return const MemoryQueryContent();
     if (stage.number == 6) return const MemoryExtractionContent();
     if (stage.number == 6.5) return const ConflictCheckContent();
+    if (stage.number == 6.7) return const CalendarContent();
     if (stage.number == 7) return const CuriosityModuleContent();
     if (stage.number == 8) return const TrustEvaluationContent();
     if (stage.number == 9) return const SaveDecisionContent();

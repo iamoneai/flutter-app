@@ -11,6 +11,8 @@ class ChatMessage {
   final DateTime timestamp;
   final String? model;
   final bool isError;
+  final Map<String, dynamic>? requestJson;
+  final Map<String, dynamic>? responseJson;
 
   ChatMessage({
     required this.id,
@@ -19,6 +21,8 @@ class ChatMessage {
     required this.timestamp,
     this.model,
     this.isError = false,
+    this.requestJson,
+    this.responseJson,
   });
 }
 
@@ -47,25 +51,28 @@ class ChatService {
     String model = 'llama3',
     bool useHistory = true,
   }) async {
-    // Add user message
+    final requestBody = {
+      'message': message,
+      'model': model,
+      'max_tokens': 1024,
+      'temperature': 0.7,
+      'use_history': useHistory,
+    };
+
+    // Add user message with request JSON
     final userMessage = ChatMessage(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       content: message,
       isUser: true,
       timestamp: DateTime.now(),
+      requestJson: requestBody,
     );
     _messages.add(userMessage);
 
     try {
       final response = await _apiService.post(
         '/api/chat',
-        {
-          'message': message,
-          'model': model,
-          'max_tokens': 1024,
-          'temperature': 0.7,
-          'use_history': useHistory,
-        },
+        requestBody,
         userId: _userIin,
       );
 
@@ -75,6 +82,7 @@ class ChatService {
         isUser: false,
         timestamp: DateTime.now(),
         model: response['model'] as String?,
+        responseJson: response,
       );
       _messages.add(assistantMessage);
 
@@ -88,6 +96,7 @@ class ChatService {
         isUser: false,
         timestamp: DateTime.now(),
         isError: true,
+        responseJson: {'error': e.toString()},
       );
       _messages.add(errorMessage);
 

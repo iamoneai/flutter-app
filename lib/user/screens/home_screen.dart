@@ -2,6 +2,7 @@
 import 'package:flutter/material.dart';
 import '../services/user_auth_service.dart';
 import '../widgets/user_sidebar.dart';
+import '../widgets/chat_widget.dart';
 import 'login_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -300,51 +301,11 @@ class _HomeScreenState extends State<HomeScreen> {
     final firstName = _userProfile?['firstName'] ??
         _userProfile?['displayName']?.toString().split(' ').first ??
         'User';
+    final userIin = _userProfile?['personalIinId'] ?? 'anonymous';
 
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Container(
-            width: 80,
-            height: 80,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              border: Border.all(
-                color: const Color(0xFFE0E0E0),
-                width: 2,
-              ),
-            ),
-            child: const Center(
-              child: Text(
-                'I',
-                style: TextStyle(
-                  fontSize: 36,
-                  fontWeight: FontWeight.bold,
-                  color: Color(0xFF1A1A1A),
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(height: 24),
-          Text(
-            'Welcome, $firstName',
-            style: const TextStyle(
-              fontSize: 24,
-              fontWeight: FontWeight.bold,
-              color: Color(0xFF1A1A1A),
-            ),
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            'Your personal AI assistant',
-            style: TextStyle(
-              fontSize: 14,
-              color: Color(0xFF666666),
-            ),
-          ),
-        ],
-      ),
+    return ChatWidget(
+      userIin: userIin,
+      userName: firstName,
     );
   }
 

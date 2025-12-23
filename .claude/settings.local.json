@@ -53,7 +53,12 @@
       "Bash(timeout /t 10 /nobreak)",
       "Bash(git push:*)",
       "Bash(git -C \"C:\\\\Users\\\\MP\\\\.claude-worktrees\\\\flutter-app\\\\quirky-lamarr\" log --oneline -10)",
-      "Bash(git -C \"C:\\\\Users\\\\MP\\\\.claude-worktrees\\\\flutter-app\\\\quirky-lamarr\" branch -a)"
+      "Bash(git -C \"C:\\\\Users\\\\MP\\\\.claude-worktrees\\\\flutter-app\\\\quirky-lamarr\" branch -a)",
+      "Bash(gcloud services enable:*)",
+      "Bash(gcloud projects describe:*)",
+      "Bash(gcloud secrets add-iam-policy-binding:*)",
+      "Bash(gcloud run deploy:*)",
+      "Bash(gcloud logging read:*)"
     ],
     "deny": [],
     "ask": []

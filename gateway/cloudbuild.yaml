@@ -1,0 +1,56 @@
+# Cloud Build configuration for deploying to Cloud Run
+# Uses Secret Manager for sensitive credentials
+# Run from repo root: gcloud builds submit --config=gateway/cloudbuild.yaml
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/iamoneai-gateway:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/iamoneai-gateway:latest'
+      - 'gateway'
+
+  # Push the container image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/iamoneai-gateway:$COMMIT_SHA'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/iamoneai-gateway:latest'
+
+  # Deploy to Cloud Run with Secret Manager access
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'iamoneai-gateway'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/iamoneai-gateway:$COMMIT_SHA'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--memory'
+      - '512Mi'
+      - '--cpu'
+      - '1'
+      - '--min-instances'
+      - '0'
+      - '--max-instances'
+      - '10'
+      - '--set-env-vars'
+      - 'GOOGLE_CLOUD_PROJECT=$PROJECT_ID,ENVIRONMENT=production,DEBUG=false,UPSTASH_REDIS_REST_URL=https://popular-marmot-46531.upstash.io,RUNPOD_LLAMA3_ENDPOINT_ID=nw34gp84qjli46,RUNPOD_MISTRAL_ENDPOINT_ID=locjnfvgkwkabi'
+
+images:
+  - 'gcr.io/$PROJECT_ID/iamoneai-gateway:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/iamoneai-gateway:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

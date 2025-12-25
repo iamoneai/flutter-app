@@ -715,8 +715,8 @@ class _ChatWidgetState extends State<ChatWidget> {
                   child: Text('Llama 3'),
                 ),
                 const PopupMenuItem(
-                  value: 'mistral',
-                  child: Text('Mistral'),
+                  value: 'nemotron',
+                  child: Text('Nemotron'),
                 ),
               ],
               child: Container(
@@ -729,7 +729,7 @@ class _ChatWidgetState extends State<ChatWidget> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Text(
-                      _selectedModel == 'llama3' ? 'Llama 3' : 'Mistral',
+                      _selectedModel == 'llama3' ? 'Llama 3' : 'Nemotron',
                       style: const TextStyle(
                         fontSize: 12,
                         color: Color(0xFF666666),

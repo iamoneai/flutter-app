@@ -1,35 +1,51 @@
 """
-LLM Service - Connects to RunPod Serverless Endpoints
-Supports Llama-3 (chat) and Nemotron (orchestration)
+LLM Service - Connects to RunPod and Groq APIs
+Supports Llama-3 (RunPod chat), Nemotron (RunPod orchestration), and Groq (ultra-fast)
 """
 import httpx
+import logging
 from typing import Optional
 from enum import Enum
 
 from app.config import settings
 
+logger = logging.getLogger(__name__)
+
 
 class LLMModel(str, Enum):
-    LLAMA3 = "llama3"      # Chat responses, conversation
-    NEMOTRON = "nemotron"  # Classification, routing, intent detection
+    LLAMA3 = "llama3"      # Chat responses, conversation (RunPod)
+    NEMOTRON = "nemotron"  # Classification, routing, intent detection (RunPod)
+    GROQ = "groq"          # Ultra-fast inference (Groq API)
 
 
 class LLMService:
     def __init__(self):
-        self.api_key = settings.runpod_api_key
-        self.endpoints = {
+        # RunPod configuration
+        self.runpod_api_key = settings.runpod_api_key
+        self.runpod_endpoints = {
             LLMModel.LLAMA3: settings.runpod_llama3_endpoint_id,
             LLMModel.NEMOTRON: settings.runpod_nemotron_endpoint_id,
         }
-        self.base_url = "https://api.runpod.ai/v2"
+        self.runpod_base_url = "https://api.runpod.ai/v2"
 
-    def _get_endpoint_url(self, model: LLMModel) -> str:
-        endpoint_id = self.endpoints[model]
-        return f"{self.base_url}/{endpoint_id}/runsync"
+        # Groq configuration
+        self.groq_api_key = settings.groq_api_key
+        self.groq_base_url = "https://api.groq.com/openai/v1"
+        self.groq_default_model = "llama-3.3-70b-versatile"
 
-    def _get_headers(self) -> dict:
+    def _get_runpod_endpoint_url(self, model: LLMModel) -> str:
+        endpoint_id = self.runpod_endpoints[model]
+        return f"{self.runpod_base_url}/{endpoint_id}/runsync"
+
+    def _get_runpod_headers(self) -> dict:
         return {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self.runpod_api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _get_groq_headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self.groq_api_key}",
             "Content-Type": "application/json",
         }
 
@@ -42,37 +58,17 @@ class LLMService:
         system_prompt: Optional[str] = None,
     ) -> dict:
         """Generate a response from the specified model"""
-        url = self._get_endpoint_url(model)
-
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
-        payload = {
-            "input": {
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            }
-        }
-
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(
-                url,
-                headers=self._get_headers(),
-                json=payload,
-            )
-            response.raise_for_status()
-            result = response.json()
-
-            return {
-                "success": True,
-                "model": model.value,
-                "response": self._extract_response(result),
-                "usage": self._extract_usage(result),
-                "raw": result,
-            }
+        return await self.generate_with_history(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
 
     async def generate_with_history(
         self,
@@ -82,7 +78,73 @@ class LLMService:
         temperature: float = 0.7,
     ) -> dict:
         """Generate a response with conversation history"""
-        url = self._get_endpoint_url(model)
+        # Route to appropriate provider
+        if model == LLMModel.GROQ:
+            return await self._generate_groq(messages, max_tokens, temperature)
+        else:
+            return await self._generate_runpod(messages, model, max_tokens, temperature)
+
+    async def _generate_groq(
+        self,
+        messages: list[dict],
+        max_tokens: int = 1024,
+        temperature: float = 0.7,
+    ) -> dict:
+        """Generate response using Groq API (OpenAI-compatible)"""
+        url = f"{self.groq_base_url}/chat/completions"
+
+        payload = {
+            "model": self.groq_default_model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        logger.info(f"[Groq] Sending request to {url} with model {self.groq_default_model}")
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                url,
+                headers=self._get_groq_headers(),
+                json=payload,
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            # Extract response from OpenAI-compatible format
+            response_text = ""
+            usage = {}
+            if "choices" in result and len(result["choices"]) > 0:
+                choice = result["choices"][0]
+                if "message" in choice:
+                    response_text = choice["message"].get("content", "")
+
+            if "usage" in result:
+                usage = {
+                    "prompt_tokens": result["usage"].get("prompt_tokens"),
+                    "completion_tokens": result["usage"].get("completion_tokens"),
+                    "total_tokens": result["usage"].get("total_tokens"),
+                }
+
+            logger.info(f"[Groq] Response received: {len(response_text)} chars")
+
+            return {
+                "success": True,
+                "model": self.groq_default_model,
+                "response": response_text,
+                "usage": usage,
+                "raw": result,
+            }
+
+    async def _generate_runpod(
+        self,
+        messages: list[dict],
+        model: LLMModel,
+        max_tokens: int = 1024,
+        temperature: float = 0.7,
+    ) -> dict:
+        """Generate response using RunPod API"""
+        url = self._get_runpod_endpoint_url(model)
 
         payload = {
             "input": {
@@ -92,10 +154,12 @@ class LLMService:
             }
         }
 
+        logger.info(f"[RunPod] Sending request to {url}")
+
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 url,
-                headers=self._get_headers(),
+                headers=self._get_runpod_headers(),
                 json=payload,
             )
             response.raise_for_status()
@@ -221,24 +285,46 @@ class LLMService:
 
     async def health_check(self, model: LLMModel) -> dict:
         """Check if an endpoint is healthy"""
-        endpoint_id = self.endpoints[model]
-        url = f"{self.base_url}/{endpoint_id}/health"
-
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(url, headers=self._get_headers())
+        if model == LLMModel.GROQ:
+            # Groq doesn't have a health endpoint, test with a simple request
+            try:
+                url = f"{self.groq_base_url}/models"
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(url, headers=self._get_groq_headers())
+                    return {
+                        "model": model.value,
+                        "status": "healthy" if response.status_code == 200 else "unhealthy",
+                        "provider": "groq",
+                    }
+            except Exception as e:
                 return {
                     "model": model.value,
-                    "status": "healthy" if response.status_code == 200 else "unhealthy",
-                    "endpoint_id": endpoint_id,
+                    "status": "error",
+                    "error": str(e),
+                    "provider": "groq",
                 }
-        except Exception as e:
-            return {
-                "model": model.value,
-                "status": "error",
-                "error": str(e),
-                "endpoint_id": endpoint_id,
-            }
+        else:
+            # RunPod health check
+            endpoint_id = self.runpod_endpoints[model]
+            url = f"{self.runpod_base_url}/{endpoint_id}/health"
+
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(url, headers=self._get_runpod_headers())
+                    return {
+                        "model": model.value,
+                        "status": "healthy" if response.status_code == 200 else "unhealthy",
+                        "endpoint_id": endpoint_id,
+                        "provider": "runpod",
+                    }
+            except Exception as e:
+                return {
+                    "model": model.value,
+                    "status": "error",
+                    "error": str(e),
+                    "endpoint_id": endpoint_id,
+                    "provider": "runpod",
+                }
 
 
 # Singleton instance

@@ -213,7 +213,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
       final userId = _adminProfile?.iin ?? _auth.currentUser?.uid ?? 'anonymous';
 
       final response = await http.post(
-        Uri.parse('https://iamoneai-gateway-203495362974.us-central1.run.app/api/chat'),
+        Uri.parse('https://iamoneai-gateway-427305522394.us-central1.run.app/api/chat'),
         headers: {
           'Content-Type': 'application/json',
           'X-User-ID': userId,

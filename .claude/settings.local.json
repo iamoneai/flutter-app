@@ -60,7 +60,8 @@
       "Bash(gcloud run deploy:*)",
       "Bash(gcloud logging read:*)",
       "Bash(cat:*)",
-      "Bash(firebase login:*)"
+      "Bash(firebase login:*)",
+      "Bash(gcloud builds submit:*)"
     ],
     "deny": [],
     "ask": []

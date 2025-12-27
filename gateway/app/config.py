@@ -75,6 +75,7 @@ class Settings:
         # Secrets are loaded lazily
         self._runpod_api_key: Optional[str] = None
         self._upstash_redis_rest_token: Optional[str] = None
+        self._groq_api_key: Optional[str] = None
 
     @property
     def runpod_api_key(self) -> str:
@@ -93,6 +94,15 @@ class Settings:
                 "UPSTASH_REDIS_REST_TOKEN", self.google_cloud_project
             ) or ""
         return self._upstash_redis_rest_token
+
+    @property
+    def groq_api_key(self) -> str:
+        """Lazy load Groq API key from Secret Manager"""
+        if self._groq_api_key is None:
+            self._groq_api_key = SecretManager.get_secret(
+                "groq-api-key", self.google_cloud_project
+            ) or ""
+        return self._groq_api_key
 
 
 @lru_cache()

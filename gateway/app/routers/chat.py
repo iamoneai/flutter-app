@@ -70,8 +70,13 @@ async def chat(
     start_time = time.time()
     user_id = x_user_id or "anonymous"
 
-    # Always use llama3 for chat (nemotron is for classification only)
-    model = LLMModel.LLAMA3
+    # Parse model from request (default to llama3)
+    try:
+        model = LLMModel(request.model.lower()) if request.model else LLMModel.LLAMA3
+    except ValueError:
+        # If invalid model, default to llama3
+        model = LLMModel.LLAMA3
+
     logger.info(f"[{user_id}] Chat request - model: {model.value}")
 
     # Rate limiting check

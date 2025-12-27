@@ -171,13 +171,15 @@ class LLMStateManager {
       name: 'Groq',
       provider: 'Groq',
       description: 'Ultra-fast inference with LPU technology',
-      models: ['llama-3-70b', 'mixtral-8x7b', 'gemma-7b'],
+      models: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768'],
       secretName: 'groq-api-key',
       brandColor: const Color(0xFFF55036),
       icon: Icons.speed,
-      isEnabled: false,
-      showInRouting: false,
-      status: 'inactive',
+      isEnabled: true,
+      showInRouting: true,
+      status: 'active',
+      latencyMs: 89,
+      lastChecked: '1 min ago',
     ),
   ];
 
@@ -718,6 +720,7 @@ class _LLMStatusContentState extends State<LLMStatusContent> {
       'anthropic-api-key',
       'openai-api-key',
       'RUNPOD_API_KEY',
+      'groq-api-key',
     ];
     return configuredSecrets.contains(provider.secretName);
   }

@@ -58,7 +58,9 @@
       "Bash(gcloud projects describe:*)",
       "Bash(gcloud secrets add-iam-policy-binding:*)",
       "Bash(gcloud run deploy:*)",
-      "Bash(gcloud logging read:*)"
+      "Bash(gcloud logging read:*)",
+      "Bash(cat:*)",
+      "Bash(firebase login:*)"
     ],
     "deny": [],
     "ask": []

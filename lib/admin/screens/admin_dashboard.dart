@@ -1,9 +1,13 @@
 // IAMONEAI - Admin Dashboard
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 import 'admin_login_screen.dart';
 import '../widgets/llm_status_content.dart';
 import '../widgets/llm_config_content.dart';
+import '../models/admin_profile.dart';
+import '../services/admin_profile_service.dart';
 
 /// Menu item data
 class MenuItem {
@@ -29,6 +33,24 @@ class AdminDashboard extends StatefulWidget {
 
 class _AdminDashboardState extends State<AdminDashboard> {
   final _auth = FirebaseAuth.instance;
+  final _profileService = AdminProfileService();
+  final _testInputController = TextEditingController();
+  final _scrollController = ScrollController();
+
+  // Admin profile
+  AdminProfile? _adminProfile;
+  bool _isLoadingProfile = true;
+  bool _isEditingProfile = false;
+  final _firstNameController = TextEditingController();
+  final _lastNameController = TextEditingController();
+  final _iinController = TextEditingController();
+
+  // Test panel state
+  String _selectedLLM = 'groq';
+  String _selectedModel = 'llama-3.3-70b-versatile';
+  bool _isTestRunning = false;
+  String _testOutput = '';
+  int? _testLatency;
 
   // Menu items (reorderable)
   List<MenuItem> _menuItems = [
@@ -84,6 +106,157 @@ class _AdminDashboardState extends State<AdminDashboard> {
 
   // Test windows height ratio (0.0 to 1.0)
   double _testWindowsHeightRatio = 0.35;
+
+  // LLM options for test panel
+  final Map<String, List<String>> _llmModels = {
+    'groq': ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768'],
+    'gemini': ['gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash'],
+    'claude': ['claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku'],
+    'openai': ['gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo'],
+    'llama3': ['llama-3-8b-instruct', 'llama-3-70b-instruct'],
+    'nemotron': ['nemotron-mini-4b-instruct'],
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _loadAdminProfile();
+  }
+
+  @override
+  void dispose() {
+    _testInputController.dispose();
+    _scrollController.dispose();
+    _firstNameController.dispose();
+    _lastNameController.dispose();
+    _iinController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadAdminProfile() async {
+    final user = _auth.currentUser;
+    if (user == null) return;
+
+    setState(() => _isLoadingProfile = true);
+
+    try {
+      var profile = await _profileService.getProfile(user.uid);
+
+      if (profile == null) {
+        // Create default profile
+        profile = await _profileService.saveProfile(
+          uid: user.uid,
+          email: user.email ?? '',
+          firstName: '',
+          lastName: '',
+        );
+      }
+
+      setState(() {
+        _adminProfile = profile;
+        _firstNameController.text = profile?.firstName ?? '';
+        _lastNameController.text = profile?.lastName ?? '';
+        _iinController.text = profile?.iin ?? '';
+        _isLoadingProfile = false;
+      });
+    } catch (e) {
+      setState(() => _isLoadingProfile = false);
+      debugPrint('Error loading admin profile: $e');
+    }
+  }
+
+  Future<void> _saveAdminProfile() async {
+    final user = _auth.currentUser;
+    if (user == null) return;
+
+    try {
+      final profile = await _profileService.saveProfile(
+        uid: user.uid,
+        email: user.email ?? '',
+        firstName: _firstNameController.text.trim(),
+        lastName: _lastNameController.text.trim(),
+        iin: _iinController.text.trim().isNotEmpty ? _iinController.text.trim() : null,
+      );
+
+      setState(() {
+        _adminProfile = profile;
+        _isEditingProfile = false;
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Profile saved'), backgroundColor: Colors.green),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error saving profile: $e'), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
+  Future<void> _runTest() async {
+    if (_testInputController.text.trim().isEmpty) return;
+
+    setState(() {
+      _isTestRunning = true;
+      _testOutput = 'Sending request...';
+      _testLatency = null;
+    });
+
+    final stopwatch = Stopwatch()..start();
+
+    try {
+      // Use admin IIN as user ID
+      final userId = _adminProfile?.iin ?? _auth.currentUser?.uid ?? 'anonymous';
+
+      final response = await http.post(
+        Uri.parse('https://iamoneai-gateway-203495362974.us-central1.run.app/api/chat'),
+        headers: {
+          'Content-Type': 'application/json',
+          'X-User-ID': userId,
+        },
+        body: jsonEncode({
+          'message': _testInputController.text.trim(),
+          'model': _selectedLLM,
+          'use_history': false,
+        }),
+      );
+
+      stopwatch.stop();
+      final latency = stopwatch.elapsedMilliseconds;
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        setState(() {
+          _testOutput = '=== Response ===\n'
+              '${data['response']}\n\n'
+              '=== Metadata ===\n'
+              'Model: ${data['model']}\n'
+              'Provider: ${data['provider']}\n'
+              'Latency: ${data['latency_ms'] ?? latency}ms\n'
+              'User ID: $userId';
+          _testLatency = data['latency_ms'] ?? latency;
+          _isTestRunning = false;
+        });
+      } else {
+        setState(() {
+          _testOutput = '=== Error ===\n'
+              'Status: ${response.statusCode}\n'
+              'Body: ${response.body}';
+          _isTestRunning = false;
+        });
+      }
+    } catch (e) {
+      stopwatch.stop();
+      setState(() {
+        _testOutput = '=== Error ===\n$e';
+        _isTestRunning = false;
+      });
+    }
+  }
 
   // Get current sub items
   List<String> get _currentSubItems =>
@@ -144,46 +317,6 @@ class _AdminDashboardState extends State<AdminDashboard> {
     });
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final user = _auth.currentUser;
-
-    return Scaffold(
-      backgroundColor: const Color(0xFFF5F5F5),
-      body: Column(
-        children: [
-          // Header
-          _buildHeader(user),
-          // Body
-          Expanded(
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                // Column A - Main Menu
-                _buildColumnA(),
-                // Resizable divider between A and B
-                if (!_isColumnACollapsed && _hasSubItems && !_isColumnBCollapsed)
-                  _buildVerticalDivider(
-                    onDrag: (delta) {
-                      setState(() {
-                        _columnAWidth = (_columnAWidth + delta).clamp(120, 280);
-                      });
-                    },
-                  ),
-                // Column B - Sub Menu (only if has items and not collapsed)
-                if (_hasSubItems) _buildColumnB(),
-                // Right side - Future Menu, Config, Test
-                Expanded(
-                  child: _buildRightSide(),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   /// Header bar
   Widget _buildHeader(User? user) {
     return Container(
@@ -213,25 +346,46 @@ class _AdminDashboardState extends State<AdminDashboard> {
             ),
           ),
           const Spacer(),
-          // User info
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            decoration: BoxDecoration(
-              color: Colors.white.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Row(
-              children: [
-                const Icon(Icons.person, color: Colors.white70, size: 20),
-                const SizedBox(width: 8),
-                Text(
-                  'Welcome, ${user?.email ?? 'Admin'}',
-                  style: const TextStyle(
-                    fontSize: 16,
-                    color: Colors.white,
+          // User info with profile
+          InkWell(
+            onTap: () => setState(() => _isEditingProfile = true),
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.person, color: Colors.white70, size: 20),
+                  const SizedBox(width: 8),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _adminProfile?.displayName ?? user?.email ?? 'Admin',
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                      ),
+                      if (_adminProfile?.iin != null)
+                        Text(
+                          'IIN: ${_adminProfile!.iin}',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: Colors.white60,
+                          ),
+                        ),
+                    ],
                   ),
-                ),
-              ],
+                  const SizedBox(width: 8),
+                  const Icon(Icons.edit, color: Colors.white54, size: 14),
+                ],
+              ),
             ),
           ),
           const SizedBox(width: 16),
@@ -787,41 +941,302 @@ class _AdminDashboardState extends State<AdminDashboard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Header
+          // Header with LLM selector
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             decoration: const BoxDecoration(
               border: Border(
                 bottom: BorderSide(color: Color(0xFF444444)),
               ),
             ),
-            child: const Row(
+            child: Row(
               children: [
-                Icon(Icons.terminal, color: Color(0xFF00FF88), size: 20),
-                SizedBox(width: 12),
-                Text(
-                  'TEST WINDOWS',
+                const Icon(Icons.terminal, color: Color(0xFF00FF88), size: 18),
+                const SizedBox(width: 10),
+                const Text(
+                  'TEST',
                   style: TextStyle(
-                    fontSize: 14,
+                    fontSize: 12,
                     fontWeight: FontWeight.w600,
                     color: Color(0xFF00FF88),
                     letterSpacing: 1,
                   ),
                 ),
+                const SizedBox(width: 16),
+                // LLM Dropdown
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF3D3D3D),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<String>(
+                      value: _selectedLLM,
+                      dropdownColor: const Color(0xFF3D3D3D),
+                      style: const TextStyle(color: Colors.white, fontSize: 13),
+                      icon: const Icon(Icons.arrow_drop_down, color: Colors.white54, size: 18),
+                      items: _llmModels.keys.map((llm) {
+                        return DropdownMenuItem(
+                          value: llm,
+                          child: Text(llm.toUpperCase()),
+                        );
+                      }).toList(),
+                      onChanged: (value) {
+                        if (value != null) {
+                          setState(() {
+                            _selectedLLM = value;
+                            _selectedModel = _llmModels[value]!.first;
+                          });
+                        }
+                      },
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                // Model Dropdown
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF3D3D3D),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<String>(
+                      value: _selectedModel,
+                      dropdownColor: const Color(0xFF3D3D3D),
+                      style: const TextStyle(color: Colors.white70, fontSize: 12),
+                      icon: const Icon(Icons.arrow_drop_down, color: Colors.white54, size: 18),
+                      items: (_llmModels[_selectedLLM] ?? []).map((model) {
+                        return DropdownMenuItem(
+                          value: model,
+                          child: Text(model, style: const TextStyle(fontSize: 11)),
+                        );
+                      }).toList(),
+                      onChanged: (value) {
+                        if (value != null) {
+                          setState(() => _selectedModel = value);
+                        }
+                      },
+                    ),
+                  ),
+                ),
+                const Spacer(),
+                // IIN badge
+                if (_adminProfile?.iin != null)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF4A4A4A),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.badge, color: Colors.amber, size: 14),
+                        const SizedBox(width: 4),
+                        Text(
+                          'IIN: ${_adminProfile!.iin}',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            color: Colors.white70,
+                            fontFamily: 'monospace',
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                if (_testLatency != null) ...[
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF4A4A4A),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      '${_testLatency}ms',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFF00FF88),
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
-          // Content
-          const Expanded(
-            child: Center(
-              child: Text(
-                'Test output will appear here',
+          // Input row
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: const BoxDecoration(
+              border: Border(
+                bottom: BorderSide(color: Color(0xFF444444)),
+              ),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _testInputController,
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                    decoration: InputDecoration(
+                      hintText: 'Enter test message...',
+                      hintStyle: const TextStyle(color: Colors.white38),
+                      filled: true,
+                      fillColor: const Color(0xFF3D3D3D),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                    onSubmitted: (_) => _runTest(),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                ElevatedButton.icon(
+                  onPressed: _isTestRunning ? null : _runTest,
+                  icon: _isTestRunning
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                        )
+                      : const Icon(Icons.play_arrow, size: 18),
+                  label: Text(_isTestRunning ? 'Running...' : 'Run'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF00AA66),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Output area
+          Expanded(
+            child: SingleChildScrollView(
+              controller: _scrollController,
+              padding: const EdgeInsets.all(16),
+              child: SelectableText(
+                _testOutput.isEmpty ? 'Test output will appear here...' : _testOutput,
                 style: TextStyle(
-                  fontSize: 16,
-                  color: Color(0xFF888888),
+                  fontSize: 13,
+                  color: _testOutput.isEmpty ? const Color(0xFF666666) : Colors.white,
                   fontFamily: 'monospace',
+                  height: 1.5,
                 ),
               ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showProfileDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Edit Profile'),
+        content: SizedBox(
+          width: 400,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: _firstNameController,
+                decoration: const InputDecoration(
+                  labelText: 'First Name',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _lastNameController,
+                decoration: const InputDecoration(
+                  labelText: 'Last Name',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _iinController,
+                decoration: const InputDecoration(
+                  labelText: 'IIN (Identification Number)',
+                  border: OutlineInputBorder(),
+                  helperText: 'Used for test requests and tracking',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              // Reset to original values
+              _firstNameController.text = _adminProfile?.firstName ?? '';
+              _lastNameController.text = _adminProfile?.lastName ?? '';
+              _iinController.text = _adminProfile?.iin ?? '';
+              Navigator.pop(context);
+            },
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _saveAdminProfile();
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = _auth.currentUser;
+
+    // Show profile dialog if editing
+    if (_isEditingProfile) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _showProfileDialog();
+        setState(() => _isEditingProfile = false);
+      });
+    }
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF5F5F5),
+      body: Column(
+        children: [
+          // Header
+          _buildHeader(user),
+          // Body
+          Expanded(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Column A - Main Menu
+                _buildColumnA(),
+                // Resizable divider between A and B
+                if (!_isColumnACollapsed && _hasSubItems && !_isColumnBCollapsed)
+                  _buildVerticalDivider(
+                    onDrag: (delta) {
+                      setState(() {
+                        _columnAWidth = (_columnAWidth + delta).clamp(120, 280);
+                      });
+                    },
+                  ),
+                // Column B - Sub Menu (only if has items and not collapsed)
+                if (_hasSubItems) _buildColumnB(),
+                // Right side - Future Menu, Config, Test
+                Expanded(
+                  child: _buildRightSide(),
+                ),
+              ],
             ),
           ),
         ],

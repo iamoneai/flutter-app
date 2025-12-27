@@ -60,6 +60,7 @@
 | **Cache** | Upstash Redis | Sessions, rate limiting, temp data |
 | **LLM** | Llama-3 (RunPod) | Default chat, fast responses |
 | | Nemotron (RunPod) | Intent classification, routing |
+| | Groq (API) | Ultra-fast inference with LPU |
 | | Claude (API) | Orchestrator, complex decisions |
 | | GPT-4 (API) | Reasoning, multi-step tasks |
 | | Gemini (API) | Fast execution, utility |
@@ -79,6 +80,7 @@
 |-------|----------|------|----------|------|
 | **Llama-3 8B** | RunPod | Chat/Generation | Default chat, fast responses | ~$0.20/hr GPU |
 | **Nemotron 70B** | RunPod | Classifier | Intent detection, routing decisions | ~$0.80/hr GPU |
+| **Llama-3.3 70B** | Groq API | Fast Chat | Ultra-fast responses (~89ms) | Pay-per-token |
 | **Claude Opus** | Anthropic API | Orchestrator | Complex decisions, planning | Pay-per-token |
 | **GPT-4 Turbo** | OpenAI API | Reasoning | Multi-step reasoning | Pay-per-token |
 | **Gemini Pro** | Google API | Executor | Fast utility tasks | Pay-per-token |

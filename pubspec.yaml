@@ -47,6 +47,9 @@ dependencies:
   # Path utilities (kept for potential future use)
   path_provider: ^2.1.5
 
+  # File picker for import/export
+  file_picker: ^8.1.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

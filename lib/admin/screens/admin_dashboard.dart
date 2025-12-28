@@ -1,13 +1,15 @@
 // IAMONEAI - Admin Dashboard
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'admin_login_screen.dart';
 import '../widgets/llm_status_content.dart';
-import '../widgets/llm_config_content.dart';
 import '../models/admin_profile.dart';
 import '../services/admin_profile_service.dart';
+import 'execution_flow_content.dart';
+import 'visual_logic_screen.dart';
 
 /// Menu item data
 class MenuItem {
@@ -50,7 +52,10 @@ class _AdminDashboardState extends State<AdminDashboard> {
   String _selectedModel = 'llama-3.3-70b-versatile';
   bool _isTestRunning = false;
   String _testOutput = '';
+  String _testRawJson = '';
   int? _testLatency;
+  bool _llmsOk = false;
+  double _testPanelSplitRatio = 0.5;
 
   // Menu items (reorderable)
   List<MenuItem> _menuItems = [
@@ -61,16 +66,22 @@ class _AdminDashboardState extends State<AdminDashboard> {
       subItems: ['Status', 'Live Status', 'Metrics'],
     ),
     const MenuItem(
-      id: 'cortex_route',
-      label: 'Cortex Route',
+      id: 'execution_flow',
+      label: 'Execution Flow',
       icon: Icons.route_outlined,
+      subItems: [],
+    ),
+    const MenuItem(
+      id: 'visual_logic',
+      label: 'Visual Logic',
+      icon: Icons.account_tree_outlined,
       subItems: [],
     ),
     const MenuItem(
       id: 'llms_config',
       label: 'LLMs Config',
       icon: Icons.memory_outlined,
-      subItems: ['Status', 'Config', 'Metrics'],
+      subItems: ['Status', 'Metrics'],
     ),
     const MenuItem(
       id: 'global_setting',
@@ -106,6 +117,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
 
   // Test windows height ratio (0.0 to 1.0)
   double _testWindowsHeightRatio = 0.35;
+  bool _isTestWindowsCollapsed = false;
+
 
   // LLM options for test panel
   final Map<String, List<String>> _llmModels = {
@@ -140,17 +153,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
     setState(() => _isLoadingProfile = true);
 
     try {
-      var profile = await _profileService.getProfile(user.uid);
-
-      if (profile == null) {
-        // Create default profile
-        profile = await _profileService.saveProfile(
-          uid: user.uid,
-          email: user.email ?? '',
-          firstName: '',
-          lastName: '',
-        );
-      }
+      final profile = await _profileService.getProfile(user.uid);
 
       setState(() {
         _adminProfile = profile;
@@ -170,12 +173,10 @@ class _AdminDashboardState extends State<AdminDashboard> {
     if (user == null) return;
 
     try {
-      final profile = await _profileService.saveProfile(
+      final profile = await _profileService.updateProfile(
         uid: user.uid,
-        email: user.email ?? '',
         firstName: _firstNameController.text.trim(),
         lastName: _lastNameController.text.trim(),
-        iin: _iinController.text.trim().isNotEmpty ? _iinController.text.trim() : null,
       );
 
       setState(() {
@@ -202,7 +203,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
 
     setState(() {
       _isTestRunning = true;
-      _testOutput = 'Sending request...';
+      _testOutput = 'Sending RAW request to $_selectedLLM...';
+      _testRawJson = '';
       _testLatency = null;
     });
 
@@ -212,47 +214,52 @@ class _AdminDashboardState extends State<AdminDashboard> {
       // Use admin IIN as user ID
       final userId = _adminProfile?.iin ?? _auth.currentUser?.uid ?? 'anonymous';
 
+      // RAW LLM test - direct to llm/raw endpoint (no chat history, no processing)
       final response = await http.post(
-        Uri.parse('https://iamoneai-gateway-427305522394.us-central1.run.app/api/chat'),
+        Uri.parse('https://iamoneai-gateway-427305522394.us-central1.run.app/api/llm/raw'),
         headers: {
           'Content-Type': 'application/json',
           'X-User-ID': userId,
         },
         body: jsonEncode({
-          'message': _testInputController.text.trim(),
+          'prompt': _testInputController.text.trim(),
           'model': _selectedLLM,
-          'use_history': false,
+          'max_tokens': 1024,
+          'temperature': 0.7,
         }),
       );
 
       stopwatch.stop();
       final latency = stopwatch.elapsedMilliseconds;
 
+      final rawJson = response.body;
+      final encoder = const JsonEncoder.withIndent('  ');
+
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
+        final formattedJson = encoder.convert(data);
+
         setState(() {
-          _testOutput = '=== Response ===\n'
-              '${data['response']}\n\n'
-              '=== Metadata ===\n'
-              'Model: ${data['model']}\n'
-              'Provider: ${data['provider']}\n'
-              'Latency: ${data['latency_ms'] ?? latency}ms\n'
-              'User ID: $userId';
+          _testOutput = data['response'] ?? data['text'] ?? 'No response text';
+          _testRawJson = formattedJson;
           _testLatency = data['latency_ms'] ?? latency;
+          _llmsOk = true;
           _isTestRunning = false;
         });
       } else {
         setState(() {
-          _testOutput = '=== Error ===\n'
-              'Status: ${response.statusCode}\n'
-              'Body: ${response.body}';
+          _testOutput = 'Error: ${response.statusCode}';
+          _testRawJson = rawJson;
+          _llmsOk = false;
           _isTestRunning = false;
         });
       }
     } catch (e) {
       stopwatch.stop();
       setState(() {
-        _testOutput = '=== Error ===\n$e';
+        _testOutput = 'Error: $e';
+        _testRawJson = '{"error": "$e"}';
+        _llmsOk = false;
         _isTestRunning = false;
       });
     }
@@ -559,6 +566,8 @@ class _AdminDashboardState extends State<AdminDashboard> {
       );
     }
 
+    final mainItem = _menuItems[_selectedMainIndex];
+
     return Container(
       width: _columnBWidth,
       decoration: const BoxDecoration(
@@ -579,7 +588,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
               ),
             ),
             child: Text(
-              _menuItems[_selectedMainIndex].label,
+              mainItem.label,
               style: const TextStyle(
                 fontSize: 14,
                 fontWeight: FontWeight.w600,
@@ -588,7 +597,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
               ),
             ),
           ),
-          // Sub menu items (always start at top)
+          // Show regular submenu
           Expanded(
             child: ListView.builder(
               padding: const EdgeInsets.only(top: 8),
@@ -727,9 +736,29 @@ class _AdminDashboardState extends State<AdminDashboard> {
 
   /// Right side - Future Menu Area, Configuration Area, Test Windows
   Widget _buildRightSide() {
+    final mainItem = _menuItems[_selectedMainIndex];
+    final isFullScreenPage = mainItem.id == 'execution_flow' || mainItem.id == 'visual_logic';
+
+    // Execution Flow and Visual Logic have their own full-screen layouts
+    if (isFullScreenPage) {
+      return Expanded(child: _buildConfigurationArea());
+    }
+
     return LayoutBuilder(
       builder: (context, constraints) {
         final totalHeight = constraints.maxHeight - 92; // Minus future menu area
+
+        if (_isTestWindowsCollapsed) {
+          // Collapsed mode: show only a thin bar
+          return Column(
+            children: [
+              _buildFutureMenuArea(),
+              Expanded(child: _buildConfigurationArea()),
+              _buildCollapsedTestBar(),
+            ],
+          );
+        }
+
         final testWindowsHeight = totalHeight * _testWindowsHeightRatio;
         final configHeight = totalHeight - testWindowsHeight;
 
@@ -747,7 +776,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
               onDrag: (delta) {
                 setState(() {
                   final newRatio = _testWindowsHeightRatio - (delta / totalHeight);
-                  _testWindowsHeightRatio = newRatio.clamp(0.15, 0.6);
+                  _testWindowsHeightRatio = newRatio.clamp(0.1, 0.85);
                 });
               },
             ),
@@ -759,6 +788,110 @@ class _AdminDashboardState extends State<AdminDashboard> {
           ],
         );
       },
+    );
+  }
+
+  /// Collapsed test bar
+  Widget _buildCollapsedTestBar() {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2D2D2D),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: () => setState(() => _isTestWindowsCollapsed = false),
+          borderRadius: BorderRadius.circular(8),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+            child: Row(
+              children: [
+                const Icon(Icons.terminal, color: Color(0xFF00FF88), size: 18),
+                const SizedBox(width: 10),
+                const Text(
+                  'RAW TEST',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xFF00FF88),
+                    letterSpacing: 1,
+                  ),
+                ),
+                const Spacer(),
+                // LLMs OK indicator
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _llmsOk ? const Color(0xFF1B4D1B) : const Color(0xFF4A4A4A),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _llmsOk ? Icons.check_circle : Icons.radio_button_unchecked,
+                        color: _llmsOk ? const Color(0xFF00FF88) : Colors.white54,
+                        size: 14,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        _llmsOk ? 'LLMs OK' : 'LLMs',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: _llmsOk ? const Color(0xFF00FF88) : Colors.white54,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                // IIN indicator
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _adminProfile?.iin != null
+                        ? const Color(0xFF4A4A4A)
+                        : const Color(0xFF4D1B1B),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _adminProfile?.iin != null ? Icons.badge : Icons.warning_amber,
+                        color: _adminProfile?.iin != null ? Colors.amber : const Color(0xFFFF6B6B),
+                        size: 14,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        _adminProfile?.iin != null
+                            ? 'IIN: ${_adminProfile!.iin}'
+                            : 'IIN (missing)',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: _adminProfile?.iin != null
+                              ? Colors.white70
+                              : const Color(0xFFFF6B6B),
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 12),
+                const Icon(Icons.expand_less, color: Colors.white54, size: 20),
+                const Text(
+                  'Expand',
+                  style: TextStyle(fontSize: 11, color: Colors.white54),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -816,12 +949,17 @@ class _AdminDashboardState extends State<AdminDashboard> {
               color: Color(0xFF999999),
             ),
           ),
+          Spacer(),
         ],
       ),
     );
   }
 
   Widget _buildConfigurationArea() {
+    final mainItem = _menuItems[_selectedMainIndex];
+    // Full-screen pages have their own header
+    final isFullScreenPage = mainItem.id == 'execution_flow' || mainItem.id == 'visual_logic';
+
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 0, 16, 0),
       decoration: BoxDecoration(
@@ -832,33 +970,42 @@ class _AdminDashboardState extends State<AdminDashboard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Header
-          Container(
-            padding: const EdgeInsets.all(20),
-            decoration: const BoxDecoration(
-              border: Border(
-                bottom: BorderSide(color: Color(0xFFE0E0E0)),
+          // Header (hide for pages with their own header)
+          if (!isFullScreenPage)
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: const BoxDecoration(
+                border: Border(
+                  bottom: BorderSide(color: Color(0xFFE0E0E0)),
+                ),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.tune, color: Color(0xFF1A1A1A), size: 24),
+                  const SizedBox(width: 12),
+                  Text(
+                    _currentSelectionLabel.toUpperCase(),
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF1A1A1A),
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ],
               ),
             ),
-            child: Row(
-              children: [
-                const Icon(Icons.tune, color: Color(0xFF1A1A1A), size: 24),
-                const SizedBox(width: 12),
-                Text(
-                  _currentSelectionLabel.toUpperCase(),
-                  style: const TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFF1A1A1A),
-                    letterSpacing: 0.5,
-                  ),
-                ),
-              ],
-            ),
-          ),
           // Content - show specific content based on selection
           Expanded(
-            child: _buildConfigContent(),
+            child: ClipRRect(
+              borderRadius: isFullScreenPage
+                  ? BorderRadius.circular(12)
+                  : const BorderRadius.only(
+                      bottomLeft: Radius.circular(12),
+                      bottomRight: Radius.circular(12),
+                    ),
+              child: _buildConfigContent(),
+            ),
           ),
         ],
       ),
@@ -874,9 +1021,14 @@ class _AdminDashboardState extends State<AdminDashboard> {
       return const LLMStatusContent();
     }
 
-    // LLMs Config > Config
-    if (mainItem.id == 'llms_config' && _selectedSubIndex == 1) {
-      return const LLMConfigContent();
+    // Execution Flow (main menu item)
+    if (mainItem.id == 'execution_flow') {
+      return _buildExecutionFlowPage();
+    }
+
+    // Visual Logic Builder (main menu item)
+    if (mainItem.id == 'visual_logic') {
+      return const VisualLogicScreen();
     }
 
     // Default placeholder content
@@ -911,6 +1063,11 @@ class _AdminDashboardState extends State<AdminDashboard> {
     );
   }
 
+  /// Execution Flow page (full 3-column UI)
+  Widget _buildExecutionFlowPage() {
+    return const ExecutionFlowContent();
+  }
+
   IconData _getConfigIcon() {
     final mainItem = _menuItems[_selectedMainIndex];
     switch (mainItem.id) {
@@ -941,7 +1098,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Header with LLM selector
+          // Header with LLM selector and status indicators
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             decoration: const BoxDecoration(
@@ -954,7 +1111,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
                 const Icon(Icons.terminal, color: Color(0xFF00FF88), size: 18),
                 const SizedBox(width: 10),
                 const Text(
-                  'TEST',
+                  'RAW TEST',
                   style: TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
@@ -1022,30 +1179,67 @@ class _AdminDashboardState extends State<AdminDashboard> {
                   ),
                 ),
                 const Spacer(),
-                // IIN badge
-                if (_adminProfile?.iin != null)
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF4A4A4A),
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.badge, color: Colors.amber, size: 14),
-                        const SizedBox(width: 4),
-                        Text(
-                          'IIN: ${_adminProfile!.iin}',
-                          style: const TextStyle(
-                            fontSize: 11,
-                            color: Colors.white70,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                      ],
-                    ),
+                // LLMs OK indicator
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _llmsOk ? const Color(0xFF1B4D1B) : const Color(0xFF4A4A4A),
+                    borderRadius: BorderRadius.circular(4),
                   ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _llmsOk ? Icons.check_circle : Icons.radio_button_unchecked,
+                        color: _llmsOk ? const Color(0xFF00FF88) : Colors.white54,
+                        size: 14,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        _llmsOk ? 'LLMs OK' : 'LLMs',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: _llmsOk ? const Color(0xFF00FF88) : Colors.white54,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                // IIN indicator
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: _adminProfile?.iin != null
+                        ? const Color(0xFF4A4A4A)
+                        : const Color(0xFF4D1B1B),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _adminProfile?.iin != null ? Icons.badge : Icons.warning_amber,
+                        color: _adminProfile?.iin != null ? Colors.amber : const Color(0xFFFF6B6B),
+                        size: 14,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        _adminProfile?.iin != null
+                            ? 'IIN: ${_adminProfile!.iin}'
+                            : 'IIN (missing)',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: _adminProfile?.iin != null
+                              ? Colors.white70
+                              : const Color(0xFFFF6B6B),
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
                 if (_testLatency != null) ...[
                   const SizedBox(width: 8),
                   Container(
@@ -1064,75 +1258,298 @@ class _AdminDashboardState extends State<AdminDashboard> {
                     ),
                   ),
                 ],
+                const SizedBox(width: 8),
+                // Collapse button
+                InkWell(
+                  onTap: () => setState(() => _isTestWindowsCollapsed = true),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF4A4A4A),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.expand_more, color: Colors.white54, size: 16),
+                        SizedBox(width: 2),
+                        Text(
+                          'Collapse',
+                          style: TextStyle(fontSize: 10, color: Colors.white54),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
               ],
             ),
           ),
-          // Input row
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: const BoxDecoration(
-              border: Border(
-                bottom: BorderSide(color: Color(0xFF444444)),
-              ),
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _testInputController,
-                    style: const TextStyle(color: Colors.white, fontSize: 14),
-                    decoration: InputDecoration(
-                      hintText: 'Enter test message...',
-                      hintStyle: const TextStyle(color: Colors.white38),
-                      filled: true,
-                      fillColor: const Color(0xFF3D3D3D),
-                      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(8),
-                        borderSide: BorderSide.none,
+          // Split panels: Left (Input/Response) and Right (JSON)
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final leftWidth = constraints.maxWidth * _testPanelSplitRatio;
+                final rightWidth = constraints.maxWidth * (1 - _testPanelSplitRatio);
+
+                return Row(
+                  children: [
+                    // LEFT PANEL - Input and Response
+                    SizedBox(
+                      width: leftWidth - 4,
+                      child: _buildLeftTestPanel(),
+                    ),
+                    // Vertical divider
+                    MouseRegion(
+                      cursor: SystemMouseCursors.resizeColumn,
+                      child: GestureDetector(
+                        onHorizontalDragUpdate: (details) {
+                          setState(() {
+                            final newRatio = _testPanelSplitRatio +
+                                (details.delta.dx / constraints.maxWidth);
+                            _testPanelSplitRatio = newRatio.clamp(0.3, 0.7);
+                          });
+                        },
+                        child: Container(
+                          width: 8,
+                          color: const Color(0xFF444444),
+                          child: Center(
+                            child: Container(
+                              width: 2,
+                              height: 40,
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF666666),
+                                borderRadius: BorderRadius.circular(1),
+                              ),
+                            ),
+                          ),
+                        ),
                       ),
                     ),
-                    onSubmitted: (_) => _runTest(),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                ElevatedButton.icon(
-                  onPressed: _isTestRunning ? null : _runTest,
-                  icon: _isTestRunning
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                        )
-                      : const Icon(Icons.play_arrow, size: 18),
-                  label: Text(_isTestRunning ? 'Running...' : 'Run'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF00AA66),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          // Output area
-          Expanded(
-            child: SingleChildScrollView(
-              controller: _scrollController,
-              padding: const EdgeInsets.all(16),
-              child: SelectableText(
-                _testOutput.isEmpty ? 'Test output will appear here...' : _testOutput,
-                style: TextStyle(
-                  fontSize: 13,
-                  color: _testOutput.isEmpty ? const Color(0xFF666666) : Colors.white,
-                  fontFamily: 'monospace',
-                  height: 1.5,
-                ),
-              ),
+                    // RIGHT PANEL - JSON
+                    SizedBox(
+                      width: rightWidth - 4,
+                      child: _buildRightTestPanel(),
+                    ),
+                  ],
+                );
+              },
             ),
           ),
         ],
       ),
+    );
+  }
+
+  /// Left panel: Input field, Run button, Response
+  Widget _buildLeftTestPanel() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // Input row
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: const BoxDecoration(
+            border: Border(
+              bottom: BorderSide(color: Color(0xFF444444)),
+            ),
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _testInputController,
+                  style: const TextStyle(color: Colors.white, fontSize: 14),
+                  decoration: InputDecoration(
+                    hintText: 'Enter test prompt...',
+                    hintStyle: const TextStyle(color: Colors.white38),
+                    filled: true,
+                    fillColor: const Color(0xFF3D3D3D),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                  onSubmitted: (_) => _runTest(),
+                ),
+              ),
+              const SizedBox(width: 12),
+              ElevatedButton.icon(
+                onPressed: _isTestRunning ? null : _runTest,
+                icon: _isTestRunning
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                      )
+                    : const Icon(Icons.play_arrow, size: 18),
+                label: Text(_isTestRunning ? 'Running...' : 'Run'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF00AA66),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                ),
+              ),
+            ],
+          ),
+        ),
+        // Response header with copy button
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: const BoxDecoration(
+            color: Color(0xFF363636),
+            border: Border(
+              bottom: BorderSide(color: Color(0xFF444444)),
+            ),
+          ),
+          child: Row(
+            children: [
+              const Text(
+                'RESPONSE',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white54,
+                  letterSpacing: 0.5,
+                ),
+              ),
+              const Spacer(),
+              InkWell(
+                onTap: () {
+                  if (_testOutput.isNotEmpty) {
+                    Clipboard.setData(ClipboardData(text: _testOutput));
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Response copied to clipboard'),
+                        duration: Duration(seconds: 1),
+                      ),
+                    );
+                  }
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF4A4A4A),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.copy, color: Colors.white54, size: 12),
+                      SizedBox(width: 4),
+                      Text(
+                        'Copy',
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: Colors.white54,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        // Response output
+        Expanded(
+          child: SingleChildScrollView(
+            controller: _scrollController,
+            padding: const EdgeInsets.all(12),
+            child: SelectableText(
+              _testOutput.isEmpty ? 'Response will appear here...' : _testOutput,
+              style: TextStyle(
+                fontSize: 13,
+                color: _testOutput.isEmpty ? const Color(0xFF666666) : Colors.white,
+                fontFamily: 'monospace',
+                height: 1.5,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Right panel: Full JSON output
+  Widget _buildRightTestPanel() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // JSON header with copy button
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: const BoxDecoration(
+            color: Color(0xFF363636),
+            border: Border(
+              bottom: BorderSide(color: Color(0xFF444444)),
+            ),
+          ),
+          child: Row(
+            children: [
+              const Text(
+                'RAW JSON',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white54,
+                  letterSpacing: 0.5,
+                ),
+              ),
+              const Spacer(),
+              InkWell(
+                onTap: () {
+                  if (_testRawJson.isNotEmpty) {
+                    Clipboard.setData(ClipboardData(text: _testRawJson));
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('JSON copied to clipboard'),
+                        duration: Duration(seconds: 1),
+                      ),
+                    );
+                  }
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF4A4A4A),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.copy, color: Colors.white54, size: 12),
+                      SizedBox(width: 4),
+                      Text(
+                        'Copy',
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: Colors.white54,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        // JSON output
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(12),
+            child: SelectableText(
+              _testRawJson.isEmpty ? '{\n  "status": "waiting for test..."\n}' : _testRawJson,
+              style: TextStyle(
+                fontSize: 12,
+                color: _testRawJson.isEmpty ? const Color(0xFF666666) : const Color(0xFF88CCFF),
+                fontFamily: 'monospace',
+                height: 1.4,
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -1145,7 +1562,28 @@ class _AdminDashboardState extends State<AdminDashboard> {
           width: 400,
           child: Column(
             mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // Email (read-only)
+              TextField(
+                controller: TextEditingController(text: _adminProfile?.email ?? _auth.currentUser?.email ?? ''),
+                readOnly: true,
+                decoration: const InputDecoration(
+                  labelText: 'Email',
+                  border: OutlineInputBorder(),
+                  filled: true,
+                  fillColor: Color(0xFFF5F5F5),
+                  suffixIcon: Icon(Icons.lock_outline, size: 18, color: Colors.grey),
+                ),
+                style: const TextStyle(color: Colors.grey),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Email cannot be changed',
+                style: TextStyle(fontSize: 11, color: Colors.grey),
+              ),
+              const SizedBox(height: 16),
+              // First Name (editable)
               TextField(
                 controller: _firstNameController,
                 decoration: const InputDecoration(
@@ -1154,6 +1592,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
                 ),
               ),
               const SizedBox(height: 16),
+              // Last Name (editable)
               TextField(
                 controller: _lastNameController,
                 decoration: const InputDecoration(
@@ -1162,13 +1601,19 @@ class _AdminDashboardState extends State<AdminDashboard> {
                 ),
               ),
               const SizedBox(height: 16),
+              // IIN (read-only)
               TextField(
                 controller: _iinController,
+                readOnly: true,
                 decoration: const InputDecoration(
                   labelText: 'IIN (Identification Number)',
                   border: OutlineInputBorder(),
-                  helperText: 'Used for test requests and tracking',
+                  filled: true,
+                  fillColor: Color(0xFFF5F5F5),
+                  suffixIcon: Icon(Icons.lock_outline, size: 18, color: Colors.grey),
+                  helperText: 'IIN is assigned automatically and cannot be changed',
                 ),
+                style: const TextStyle(color: Colors.grey),
               ),
             ],
           ),
@@ -1179,7 +1624,6 @@ class _AdminDashboardState extends State<AdminDashboard> {
               // Reset to original values
               _firstNameController.text = _adminProfile?.firstName ?? '';
               _lastNameController.text = _adminProfile?.lastName ?? '';
-              _iinController.text = _adminProfile?.iin ?? '';
               Navigator.pop(context);
             },
             child: const Text('Cancel'),
@@ -1232,6 +1676,15 @@ class _AdminDashboardState extends State<AdminDashboard> {
                   ),
                 // Column B - Sub Menu (only if has items and not collapsed)
                 if (_hasSubItems) _buildColumnB(),
+                // Resizable divider between Column B and right side
+                if (_hasSubItems && !_isColumnBCollapsed)
+                  _buildVerticalDivider(
+                    onDrag: (delta) {
+                      setState(() {
+                        _columnBWidth = (_columnBWidth + delta).clamp(150, 320);
+                      });
+                    },
+                  ),
                 // Right side - Future Menu, Config, Test
                 Expanded(
                   child: _buildRightSide(),

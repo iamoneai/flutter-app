@@ -17,15 +17,27 @@ service cloud.firestore {
       );
     }
 
+    // Check if user is an admin via admin_profiles collection
+    function isAdmin() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/admin_profiles/$(request.auth.uid));
+    }
+
     // Super admin has full access
     match /{document=**} {
       allow read, write: if isSuperAdmin();
     }
 
+    // Admin profiles
+    match /admin_profiles/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isOwner(userId) || isSuperAdmin();
+    }
+
     // Admin collection
     match /admin/{document=**} {
       allow read: if isAuthenticated();
-      allow write: if isSuperAdmin();
+      allow write: if isAdmin() || isSuperAdmin();
     }
 
     // User profiles
@@ -43,6 +55,23 @@ service cloud.firestore {
     // User sessions
     match /user_sessions/{uid} {
       allow read, write: if isOwner(uid) || isSuperAdmin();
+    }
+
+    // Pipeline configuration (admin only)
+    match /pipeline_config/{stageId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() || isSuperAdmin();
+    }
+
+    // Config collection (LLMs, pipeline settings, etc.)
+    // Allow any authenticated user to manage config (admin panel is already protected)
+    match /config/{configId} {
+      allow read, write: if isAuthenticated();
+
+      // Sub-collections under config (e.g., config/llms/providers)
+      match /{subcollection}/{docId} {
+        allow read, write: if isAuthenticated();
+      }
     }
   }
 }

@@ -15,6 +15,13 @@ import '../services/canvas_history_service.dart';
 import '../services/canvas_validation_service.dart';
 import '../models/visual_builder_models.dart';
 
+/// Canvas tool modes
+enum _CanvasTool {
+  select,  // Default pointer/select tool
+  pan,     // Hand tool for panning
+  zoom,    // Zoom tool
+}
+
 class VisualLogicScreen extends StatefulWidget {
   const VisualLogicScreen({super.key});
 
@@ -58,12 +65,14 @@ class _VisualLogicScreenState extends State<VisualLogicScreen> {
   static const double _minPanelWidth = 200;
   static const double _maxLeftPanelWidth = 350;
   static const double _maxRightPanelWidth = 400;
+  bool _isLeftPanelCollapsed = false;
+  bool _isRightPanelCollapsed = false;
 
   // Test panel
   double _testPanelHeight = 250;
   static const double _minTestPanelHeight = 100;
   static const double _maxTestPanelHeight = 400;
-  bool _isTestPanelCollapsed = false;
+  bool _isTestPanelCollapsed = true;
 
   // Canvas state
   double _zoom = 1.0;
@@ -73,6 +82,9 @@ class _VisualLogicScreenState extends State<VisualLogicScreen> {
   int _nextId = 1;
   bool _showGrid = true;
   bool _showMinimap = false;
+
+  // Canvas tool
+  _CanvasTool _selectedTool = _CanvasTool.select;
 
   // Pan state
   bool _isPanning = false;
@@ -695,6 +707,38 @@ class _VisualLogicScreenState extends State<VisualLogicScreen> {
   // LEFT PANEL - Element Palette
   // ============================================================================
   Widget _buildLeftPanel() {
+    // Collapsed state
+    if (_isLeftPanelCollapsed) {
+      return Container(
+        width: 40,
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          border: Border(right: BorderSide(color: Color(0xFFE0E0E0))),
+        ),
+        child: Column(
+          children: [
+            InkWell(
+              onTap: () => setState(() => _isLeftPanelCollapsed = false),
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                child: const Icon(Icons.chevron_right, size: 20, color: Color(0xFF666666)),
+              ),
+            ),
+            const RotatedBox(
+              quarterTurns: 3,
+              child: Padding(
+                padding: EdgeInsets.all(8),
+                child: Text(
+                  'ELEMENTS',
+                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF999999)),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Container(
       width: _leftPanelWidth,
       decoration: const BoxDecoration(
@@ -712,6 +756,11 @@ class _VisualLogicScreenState extends State<VisualLogicScreen> {
             ),
             child: Row(
               children: [
+                InkWell(
+                  onTap: () => setState(() => _isLeftPanelCollapsed = true),
+                  child: const Icon(Icons.chevron_left, size: 18, color: Color(0xFF999999)),
+                ),
+                const SizedBox(width: 4),
                 const Text(
                   'ELEMENTS',
                   style: TextStyle(
@@ -1362,6 +1411,12 @@ class _VisualLogicScreenState extends State<VisualLogicScreen> {
                             bottom: 16,
                             child: _buildMinimap(),
                           ),
+                        // Canvas tools floating toolbar
+                        Positioned(
+                          left: 16,
+                          bottom: 16,
+                          child: _buildCanvasToolbar(),
+                        ),
                       ],
                     ),
                   ),
@@ -1949,6 +2004,89 @@ class _VisualLogicScreenState extends State<VisualLogicScreen> {
     );
   }
 
+  Widget _buildCanvasToolbar() {
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      child: Container(
+        width: 44,
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Select tool
+            _buildToolButton(
+              icon: Icons.near_me,
+              isSelected: _selectedTool == _CanvasTool.select,
+              tooltip: 'Select Tool (V)',
+              onPressed: () => setState(() => _selectedTool = _CanvasTool.select),
+            ),
+            // Pan tool
+            _buildToolButton(
+              icon: Icons.pan_tool,
+              isSelected: _selectedTool == _CanvasTool.pan,
+              tooltip: 'Pan Tool (H)',
+              onPressed: () => setState(() => _selectedTool = _CanvasTool.pan),
+            ),
+            // Zoom tool
+            _buildToolButton(
+              icon: Icons.zoom_in,
+              isSelected: _selectedTool == _CanvasTool.zoom,
+              tooltip: 'Zoom Tool (Z)',
+              onPressed: () => setState(() => _selectedTool = _CanvasTool.zoom),
+            ),
+            const Divider(height: 8),
+            // Zoom to fit
+            _buildToolButton(
+              icon: Icons.fit_screen,
+              isSelected: false,
+              tooltip: 'Zoom to Fit',
+              onPressed: _zoomToFit,
+            ),
+            // Reset view
+            _buildToolButton(
+              icon: Icons.center_focus_strong,
+              isSelected: false,
+              tooltip: 'Reset View',
+              onPressed: () => setState(() {
+                _zoom = 1.0;
+                _canvasOffset = Offset.zero;
+              }),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildToolButton({
+    required IconData icon,
+    required bool isSelected,
+    required String tooltip,
+    required VoidCallback onPressed,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: GestureDetector(
+        onTap: onPressed,
+        child: Container(
+          width: 36,
+          height: 36,
+          margin: const EdgeInsets.symmetric(vertical: 2),
+          decoration: BoxDecoration(
+            color: isSelected ? const Color(0xFFE3F2FD) : Colors.transparent,
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Icon(
+            icon,
+            size: 20,
+            color: isSelected ? const Color(0xFF1976D2) : const Color(0xFF666666),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildMinimap() {
     // Get canvas size for viewport calculation
     final renderBox = _canvasKey.currentContext?.findRenderObject() as RenderBox?;
@@ -2338,6 +2476,38 @@ class _VisualLogicScreenState extends State<VisualLogicScreen> {
   // RIGHT PANEL - Settings
   // ============================================================================
   Widget _buildRightPanel() {
+    // Collapsed state
+    if (_isRightPanelCollapsed) {
+      return Container(
+        width: 40,
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          border: Border(left: BorderSide(color: Color(0xFFE0E0E0))),
+        ),
+        child: Column(
+          children: [
+            InkWell(
+              onTap: () => setState(() => _isRightPanelCollapsed = false),
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                child: const Icon(Icons.chevron_left, size: 20, color: Color(0xFF666666)),
+              ),
+            ),
+            const RotatedBox(
+              quarterTurns: 1,
+              child: Padding(
+                padding: EdgeInsets.all(8),
+                child: Text(
+                  'SETTINGS',
+                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFF999999)),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Container(
       width: _rightPanelWidth,
       decoration: const BoxDecoration(
@@ -2353,14 +2523,23 @@ class _VisualLogicScreenState extends State<VisualLogicScreen> {
             decoration: const BoxDecoration(
               border: Border(bottom: BorderSide(color: Color(0xFFE0E0E0))),
             ),
-            child: const Text(
-              'SETTINGS',
-              style: TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
-                color: Color(0xFF999999),
-                letterSpacing: 0.5,
-              ),
+            child: Row(
+              children: [
+                const Text(
+                  'SETTINGS',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF999999),
+                    letterSpacing: 0.5,
+                  ),
+                ),
+                const Spacer(),
+                InkWell(
+                  onTap: () => setState(() => _isRightPanelCollapsed = true),
+                  child: const Icon(Icons.chevron_right, size: 18, color: Color(0xFF999999)),
+                ),
+              ],
             ),
           ),
           // Settings content

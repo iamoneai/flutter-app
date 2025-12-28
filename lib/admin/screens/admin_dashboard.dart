@@ -8,7 +8,6 @@ import 'admin_login_screen.dart';
 import '../widgets/llm_status_content.dart';
 import '../models/admin_profile.dart';
 import '../services/admin_profile_service.dart';
-import 'execution_flow_content.dart';
 import 'visual_logic_screen.dart';
 
 /// Menu item data
@@ -59,18 +58,6 @@ class _AdminDashboardState extends State<AdminDashboard> {
 
   // Menu items (reorderable)
   List<MenuItem> _menuItems = [
-    const MenuItem(
-      id: 'dashboard',
-      label: 'Dashboard',
-      icon: Icons.dashboard_outlined,
-      subItems: ['Status', 'Live Status', 'Metrics'],
-    ),
-    const MenuItem(
-      id: 'execution_flow',
-      label: 'Execution Flow',
-      icon: Icons.route_outlined,
-      subItems: [],
-    ),
     const MenuItem(
       id: 'visual_logic',
       label: 'Visual Logic',
@@ -512,7 +499,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
       child: InkWell(
         onTap: () => _onMainMenuSelected(index),
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
           decoration: BoxDecoration(
             color: isSelected ? const Color(0xFFF0F0F0) : Colors.transparent,
             border: Border(
@@ -526,17 +513,17 @@ class _AdminDashboardState extends State<AdminDashboard> {
             children: [
               Icon(
                 item.icon,
-                size: 22,
+                size: 18,
                 color: isSelected
                     ? const Color(0xFF1A1A1A)
                     : const Color(0xFF666666),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 10),
               Expanded(
                 child: Text(
                   item.label,
                   style: TextStyle(
-                    fontSize: 16,
+                    fontSize: 13,
                     fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
                     color: isSelected
                         ? const Color(0xFF1A1A1A)
@@ -737,9 +724,9 @@ class _AdminDashboardState extends State<AdminDashboard> {
   /// Right side - Future Menu Area, Configuration Area, Test Windows
   Widget _buildRightSide() {
     final mainItem = _menuItems[_selectedMainIndex];
-    final isFullScreenPage = mainItem.id == 'execution_flow' || mainItem.id == 'visual_logic';
+    final isFullScreenPage = mainItem.id == 'visual_logic';
 
-    // Execution Flow and Visual Logic have their own full-screen layouts
+    // Visual Logic has its own full-screen layout
     if (isFullScreenPage) {
       return Expanded(child: _buildConfigurationArea());
     }
@@ -958,7 +945,7 @@ class _AdminDashboardState extends State<AdminDashboard> {
   Widget _buildConfigurationArea() {
     final mainItem = _menuItems[_selectedMainIndex];
     // Full-screen pages have their own header
-    final isFullScreenPage = mainItem.id == 'execution_flow' || mainItem.id == 'visual_logic';
+    final isFullScreenPage = mainItem.id == 'visual_logic';
 
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 0, 16, 0),
@@ -1021,11 +1008,6 @@ class _AdminDashboardState extends State<AdminDashboard> {
       return const LLMStatusContent();
     }
 
-    // Execution Flow (main menu item)
-    if (mainItem.id == 'execution_flow') {
-      return _buildExecutionFlowPage();
-    }
-
     // Visual Logic Builder (main menu item)
     if (mainItem.id == 'visual_logic') {
       return const VisualLogicScreen();
@@ -1063,16 +1045,9 @@ class _AdminDashboardState extends State<AdminDashboard> {
     );
   }
 
-  /// Execution Flow page (full 3-column UI)
-  Widget _buildExecutionFlowPage() {
-    return const ExecutionFlowContent();
-  }
-
   IconData _getConfigIcon() {
     final mainItem = _menuItems[_selectedMainIndex];
     switch (mainItem.id) {
-      case 'dashboard':
-        return Icons.dashboard_outlined;
       case 'cortex_route':
         return Icons.route_outlined;
       case 'llms_config':
